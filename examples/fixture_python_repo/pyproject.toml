@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fixture-python-repo"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = []
+
+[dependency-groups]
+dev = [
+  "pytest>=8",
+  "ruff>=0.5",
+  "mypy>=1.10",
+  "pip-audit>=2.7",
+]
+
+[tool.ruff]
+line-length = 88
+
+[tool.mypy]
+python_version = "3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

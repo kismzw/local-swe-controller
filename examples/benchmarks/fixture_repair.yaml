@@ -1,0 +1,18 @@
+name: fixture-repair
+repo: ../fixture_python_repo
+mode: repair
+goal: Fix failing tests
+model_profile: fake
+generate_tests: false
+orchestrator: deterministic
+max_iters: 1
+max_candidates: 1
+expected_status: NO_ACTION_NEEDED
+acceptance_commands:
+  - command:
+      - python
+      - -m
+      - pytest
+    env:
+      PYTHONPATH: src
+notes: Repair should detect the fixture already passes and avoid mutating the target repo.

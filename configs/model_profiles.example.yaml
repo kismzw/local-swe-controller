@@ -1,0 +1,145 @@
+# configs/model_profiles.example.yaml
+
+defaults:
+  provider: "openai_compatible"
+  timeout_seconds: 120
+  max_retries: 2
+  retry_backoff_seconds: 2
+  stream: false
+
+models:
+  main_patch_model:
+    description: "Primary local coding model for patch generation on RTX 5090-class machines."
+    provider: "openai_compatible"
+    base_url: "http://localhost:8000/v1"
+    api_key_env: "LOCAL_SWE_MAIN_MODEL_API_KEY"
+    api_key_default: "not-needed"
+    model: "Qwen3-Coder-30B-A3B-Instruct-AWQ"
+    context_window: 262144
+    temperature: 0.2
+    top_p: 0.95
+    max_output_tokens: 8192
+    timeout_seconds: 180
+
+  fast_triage_model:
+    description: "Small local model for cheap triage, failure classification, and summaries."
+    provider: "openai_compatible"
+    base_url: "http://localhost:8001/v1"
+    api_key_env: "LOCAL_SWE_FAST_MODEL_API_KEY"
+    api_key_default: "not-needed"
+    model: "Qwen3-8B-Instruct"
+    context_window: 32768
+    temperature: 0.1
+    top_p: 0.9
+    max_output_tokens: 4096
+    timeout_seconds: 60
+
+  fallback_reasoning_model:
+    description: "Optional fallback model for difficult root-cause analysis."
+    provider: "openai_compatible"
+    base_url: "http://localhost:8002/v1"
+    api_key_env: "LOCAL_SWE_FALLBACK_MODEL_API_KEY"
+    api_key_default: "not-needed"
+    model: "DeepSeek-R1-Distill-Qwen-32B-Q4"
+    context_window: 65536
+    temperature: 0.2
+    top_p: 0.95
+    max_output_tokens: 8192
+    timeout_seconds: 180
+
+  fake:
+    description: "Deterministic fake model for tests. Does not require GPU or server."
+    provider: "fake"
+    model: "fake"
+    context_window: 8192
+    temperature: 0.0
+    max_output_tokens: 2048
+
+routing:
+  policy_extraction: "fast_triage_model"
+  failure_classification: "fast_triage_model"
+  failure_summary: "fast_triage_model"
+  fault_localization: "main_patch_model"
+  patch_generation: "main_patch_model"
+  patch_review: "main_patch_model"
+  difficult_root_cause: "fallback_reasoning_model"
+  test_generation: "main_patch_model"
+
+test_routing:
+  policy_extraction: "fake"
+  failure_classification: "fake"
+  failure_summary: "fake"
+  fault_localization: "fake"
+  patch_generation: "fake"
+  patch_review: "fake"
+  difficult_root_cause: "fake"
+  test_generation: "fake"
+
+prompt_limits:
+  max_files_per_prompt: 12
+  max_log_chars: 20000
+  max_file_chars: 20000
+  max_total_context_chars: 120000
+  include_full_repo: false
+
+structured_outputs:
+  require_json_for:
+    - "failure_classification"
+    - "fault_localization"
+    - "patch_review"
+
+  schemas:
+    failure_classification:
+      type: "object"
+      required:
+        - "failure_class"
+        - "confidence"
+        - "reason"
+      properties:
+        failure_class:
+          type: "string"
+          enum:
+            - "ENVIRONMENT"
+            - "BUILD"
+            - "FORMAT"
+            - "LINT"
+            - "TYPECHECK"
+            - "TEST"
+            - "SECURITY"
+            - "RESOURCE_EXHAUSTION"
+            - "POLICY_VIOLATION"
+            - "UNKNOWN"
+        confidence:
+          type: "number"
+          minimum: 0
+          maximum: 1
+        reason:
+          type: "string"
+
+    fault_localization:
+      type: "object"
+      required:
+        - "suspect_files"
+        - "reason"
+      properties:
+        suspect_files:
+          type: "array"
+          items:
+            type: "string"
+        reason:
+          type: "string"
+
+    patch_review:
+      type: "object"
+      required:
+        - "decision"
+        - "reason"
+      properties:
+        decision:
+          type: "string"
+          enum:
+            - "accept_for_validation"
+            - "reject"
+            - "requires_approval"
+        reason:
+          type: "string"

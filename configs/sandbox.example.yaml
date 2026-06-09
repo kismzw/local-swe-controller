@@ -1,0 +1,73 @@
+# configs/sandbox.example.yaml
+
+sandbox:
+  strategy: "git_worktree"
+  temp_root: null
+  keep_worktree: false
+  cleanup_on_error: true
+  warn_on_dirty_repo: true
+  include_dirty_changes: false
+
+worktree:
+  prefix: "local-swe-"
+  detach_head: true
+  require_git_repo: true
+  allow_nested_repos: false
+
+command_execution:
+  shell: false
+  timeout_seconds: 300
+  kill_process_group_on_timeout: true
+  capture_stdout: true
+  capture_stderr: true
+  max_stdout_bytes: 5000000
+  max_stderr_bytes: 5000000
+  redact_secrets: true
+
+environment:
+  inherit_parent_env: true
+  remove_env_vars:
+    - "OPENAI_API_KEY"
+    - "ANTHROPIC_API_KEY"
+    - "GITHUB_TOKEN"
+    - "AWS_ACCESS_KEY_ID"
+    - "AWS_SECRET_ACCESS_KEY"
+    - "GOOGLE_API_KEY"
+  set_env_vars:
+    LOCAL_SWE_RUNNING: "1"
+    PYTHONUNBUFFERED: "1"
+
+network:
+  allow_network: false
+  approval_required_for_network: true
+
+filesystem:
+  allow_write_inside_worktree: true
+  allow_write_outside_worktree: false
+  allow_read_outside_worktree: false
+  allowed_output_root: ".local-swe"
+
+approval:
+  require_for:
+    - "network_access"
+    - "dependency_addition"
+    - "global_install"
+    - "license_change"
+    - "lockfile_change"
+    - "large_diff"
+    - "security_sensitive_code"
+    - "ci_change"
+
+resource_limits:
+  max_total_runtime_seconds: 3600
+  max_command_runtime_seconds: 300
+  max_parallel_commands: 1
+  max_patch_candidates: 1
+  max_iterations: 1
+
+logs:
+  save_stdout: true
+  save_stderr: true
+  save_command_json: true
+  save_environment_summary: true
+  save_worktree_path: true

@@ -1,0 +1,367 @@
+# configs/default_policy.yaml
+
+policy_version: "0.1"
+
+defaults:
+  timeout_seconds: 300
+  max_total_runtime_seconds: 3600
+  max_iters: 1
+  max_candidates: 1
+  max_diff_lines: 500
+  keep_worktree: false
+  require_approval_for_risky_changes: true
+  stop_on_security_failure: true
+  stop_on_policy_violation: true
+  stop_on_repeated_failure: true
+
+artifact_paths:
+  root: ".local-swe"
+  runs: ".local-swe/runs"
+  logs: ".local-swe/logs"
+  patches: ".local-swe/patches"
+  policies: ".local-swe/policies"
+
+command_policy:
+  prefer_shell_false: true
+  allow_shell: false
+  allow_network_by_default: false
+  allow_global_installs: false
+  allow_target_repo_mutation: false
+  allow_model_generated_commands: false
+
+forbidden_commands:
+  - "rm -rf"
+  - "git push --force"
+  - "sudo"
+  - "curl | bash"
+  - "wget | bash"
+  - "chmod -R 777"
+  - "chown -R"
+  - "npm install -g"
+  - "pip install --user"
+  - "docker system prune"
+  - "git reset --hard"
+  - "git clean -fdx"
+
+forbidden_paths:
+  - ".git/"
+  - ".local-swe/policies/"
+  - ".env"
+  - ".env.local"
+  - ".env.production"
+  - "secrets/"
+  - "private/"
+  - "id_rsa"
+  - "id_ed25519"
+
+approval_required_operations:
+  - "dependency_addition"
+  - "dependency_removal"
+  - "lockfile_change"
+  - "license_change"
+  - "large_diff"
+  - "security_sensitive_code"
+  - "ci_change"
+  - "test_removal"
+  - "generated_file_change"
+  - "migration"
+  - "network_access"
+
+hard_gates:
+  - "build"
+  - "format"
+  - "lint"
+  - "typecheck"
+  - "test"
+  - "security"
+  - "policy"
+
+soft_gates:
+  - "docs_updated"
+  - "changelog_updated"
+  - "coverage_not_decreased"
+  - "performance_not_degraded"
+
+language_inference:
+  python:
+    files:
+      - "pyproject.toml"
+      - "setup.py"
+      - "setup.cfg"
+      - "requirements.txt"
+    package_managers:
+      uv:
+        markers:
+          - "uv.lock"
+        command_prefix:
+          - "uv"
+          - "run"
+      poetry:
+        markers:
+          - "poetry.lock"
+        command_prefix:
+          - "poetry"
+          - "run"
+      pip:
+        markers:
+          - "requirements.txt"
+        command_prefix: []
+    command_inference:
+      format:
+        ruff:
+          command:
+            - "ruff"
+            - "format"
+            - "--check"
+            - "."
+      lint:
+        ruff:
+          command:
+            - "ruff"
+            - "check"
+            - "."
+      typecheck:
+        mypy:
+          command:
+            - "mypy"
+            - "."
+        pyright:
+          command:
+            - "pyright"
+      test:
+        pytest:
+          command:
+            - "pytest"
+
+  javascript:
+    files:
+      - "package.json"
+      - "package-lock.json"
+      - "pnpm-lock.yaml"
+      - "yarn.lock"
+    script_names:
+      format:
+        - "format"
+        - "format:check"
+      lint:
+        - "lint"
+      typecheck:
+        - "typecheck"
+        - "tsc"
+      test:
+        - "test"
+
+  rust:
+    files:
+      - "Cargo.toml"
+      - "Cargo.lock"
+    command_inference:
+      build:
+        command:
+          - "cargo"
+          - "check"
+      lint:
+        command:
+          - "cargo"
+          - "clippy"
+          - "--"
+          - "-D"
+          - "warnings"
+      test:
+        command:
+          - "cargo"
+          - "test"
+
+  make:
+    files:
+      - "Makefile"
+    preferred_targets:
+      format:
+        - "format-check"
+        - "format"
+      lint:
+        - "lint"
+      typecheck:
+        - "typecheck"
+      test:
+        - "test"
+        - "test-fast"
+      security:
+        - "security"
+        - "audit"
+
+failure_classification:
+  environment_patterns:
+    - "ModuleNotFoundError"
+    - "ImportError"
+    - "command not found"
+    - "No such file or directory"
+    - "could not find executable"
+    - "Cannot find module"
+    - "package not found"
+
+  build_patterns:
+    - "SyntaxError"
+    - "Build failed"
+    - "compilation failed"
+    - "failed to build"
+    - "error: could not compile"
+
+  lint_patterns:
+    - "ruff"
+    - "eslint"
+    - "clippy"
+    - "flake8"
+    - "pylint"
+
+  typecheck_patterns:
+    - "mypy"
+    - "pyright"
+    - "tsc"
+    - "Type error"
+    - "type error"
+
+  test_patterns:
+    - "pytest"
+    - "FAILED"
+    - "AssertionError"
+    - "cargo test"
+    - "npm test"
+    - "test failed"
+
+  security_patterns:
+    - "vulnerability"
+    - "CVE-"
+    - "pip-audit"
+    - "osv-scanner"
+    - "CodeQL"
+    - "secret detected"
+
+  resource_exhaustion_patterns:
+    - "timed out"
+    - "timeout"
+    - "Killed"
+    - "Out of memory"
+    - "OOM"
+    - "Resource temporarily unavailable"
+
+optional_security_scanners:
+  pip-audit:
+    command:
+      - "uv"
+      - "run"
+      - "pip-audit"
+      - "--format"
+      - "json"
+    pyproject_tools:
+      - "pip-audit"
+    description: "Python dependency vulnerability audit"
+
+  osv-scanner:
+    command:
+      - "osv-scanner"
+      - "scan"
+      - "-r"
+      - "."
+      - "--format"
+      - "json"
+    marker_files:
+      - ".osv-scanner.toml"
+      - "osv-scanner.toml"
+    package_json_scripts:
+      - "osv"
+      - "osv-scanner"
+    description: "OSV vulnerability scan"
+
+  detect-secrets:
+    command:
+      - "detect-secrets"
+      - "scan"
+      - "--all-files"
+    marker_files:
+      - ".secrets.baseline"
+      - ".pre-commit-config.yaml"
+    description: "Secret detection scan"
+
+  reuse:
+    command:
+      - "reuse"
+      - "lint"
+    marker_files:
+      - "REUSE.toml"
+      - ".reuse/dep5"
+    description: "License compliance scan"
+
+patch_policy:
+  max_diff_lines: 500
+
+  dependency_files:
+    - "pyproject.toml"
+    - "requirements.txt"
+    - "requirements-dev.txt"
+    - "setup.py"
+    - "setup.cfg"
+    - "package.json"
+    - "Cargo.toml"
+
+  lockfiles:
+    - "uv.lock"
+    - "poetry.lock"
+    - "package-lock.json"
+    - "pnpm-lock.yaml"
+    - "yarn.lock"
+    - "Cargo.lock"
+
+  license_files:
+    - "LICENSE"
+    - "LICENSE.md"
+    - "COPYING"
+    - "NOTICE"
+    - "REUSE.toml"
+
+  ci_files:
+    - ".github/workflows/"
+    - ".gitlab-ci.yml"
+    - "azure-pipelines.yml"
+    - "Jenkinsfile"
+
+  test_paths:
+    - "tests/"
+    - "test/"
+    - "__tests__/"
+    - "spec/"
+    - "src/test/"
+
+  security_sensitive_paths:
+    - "auth/"
+    - "security/"
+    - "secrets/"
+    - "keys/"
+    - ".github/workflows/"
+    - ".pre-commit-config.yaml"
+    - ".secrets.baseline"
+    - ".env"
+    - ".env.local"
+
+  secret_patterns:
+    - "AKIA"
+    - "BEGIN PRIVATE KEY"
+    - "api_key"
+    - "secret_key"
+    - "password="
+    - "token="
+    - "ghp_"
+
+  reject_by_default:
+    test_removal: true
+    policy_weakening: true
+    ci_weakening: true
+    security_weakening: true
+    dependency_change_without_approval: true
+    lockfile_change_without_approval: true
+    license_change_without_approval: true
+
+observability:
+  open_telemetry:
+    enabled: false
+    service_name: "local-swe-controller"

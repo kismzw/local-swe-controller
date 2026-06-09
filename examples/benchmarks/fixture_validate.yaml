@@ -1,0 +1,12 @@
+name: fixture-validate
+repo: ../fixture_python_repo
+mode: validate
+expected_status: NO_ACTION_NEEDED
+acceptance_commands:
+  - command:
+      - python
+      - -m
+      - pytest
+    env:
+      PYTHONPATH: src
+notes: Validate the fixture repository in a fresh worktree and confirm tests still pass.
