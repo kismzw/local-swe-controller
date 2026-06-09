@@ -5,16 +5,64 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from time import monotonic
 
-from local_swe_controller.exceptions import CommandSafetyError
+from local_swe_controller.exceptions import CommandSafetyError, ValidationError
 from local_swe_controller.models import CommandResult, CommandSpec
 
 _SHELL_META_TOKENS = {"|", "||", "&", "&&", ";", ">", ">>", "<", "<<", "$(", "`"}
 _SHELL_LAUNCHERS = {"sh", "bash", "zsh", "fish", "cmd", "powershell", "pwsh"}
 _SHELL_FLAGS = {"-c", "/c"}
+_PYTHON_TOOLS = {"pytest", "ruff", "black", "mypy"}
+
+
+@dataclass(frozen=True, slots=True)
+class PythonExecutionConfig:
+    selected_python: Path
+    target_repo_root: Path
+
+
+def resolve_selected_python(
+    *,
+    python_path: Path | None = None,
+    venv_path: Path | None = None,
+) -> Path | None:
+    resolved_python = _validate_python_path(python_path) if python_path else None
+    resolved_venv_python = _validate_venv_path(venv_path) if venv_path else None
+    if (
+        resolved_python
+        and resolved_venv_python
+        and resolved_python.resolve() != resolved_venv_python.resolve()
+    ):
+        raise ValidationError(
+            "--python and --venv must resolve to the same interpreter."
+        )
+    return resolved_python or resolved_venv_python
+
+
+def _validate_python_path(python_path: Path) -> Path:
+    expanded = python_path.expanduser()
+    resolved = expanded.resolve()
+    if not resolved.exists():
+        raise ValidationError(f"Selected Python interpreter does not exist: {expanded}")
+    if not resolved.is_file():
+        raise ValidationError(f"Selected Python interpreter is not a file: {expanded}")
+    if not os.access(resolved, os.X_OK):
+        raise ValidationError(f"Selected Python interpreter is not executable: {expanded}")
+    return expanded
+
+
+def _validate_venv_path(venv_path: Path) -> Path:
+    resolved_venv = venv_path.expanduser().resolve()
+    if not resolved_venv.exists():
+        raise ValidationError(f"Selected virtualenv does not exist: {resolved_venv}")
+    interpreter = resolved_venv / "bin" / "python"
+    if not interpreter.exists():
+        raise ValidationError(f"Selected virtualenv does not contain bin/python: {resolved_venv}")
+    return _validate_python_path(interpreter)
 
 
 class CommandSafetyChecker:
@@ -66,10 +114,12 @@ class CommandRunner:
         artifact_dir: Path | None = None,
         default_timeout_seconds: int | None = None,
         allowed_cwd_root: Path | None = None,
+        python_config: PythonExecutionConfig | None = None,
     ) -> None:
         self.safety_checker = CommandSafetyChecker(forbidden_commands)
         self.default_timeout_seconds = default_timeout_seconds
         self.allowed_cwd_root = allowed_cwd_root.resolve() if allowed_cwd_root else None
+        self.python_config = python_config
         self.artifact_dir = artifact_dir or Path(
             tempfile.mkdtemp(prefix="local-swe-command-artifacts-")
         )
@@ -82,13 +132,19 @@ class CommandRunner:
         cwd: Path | None = None,
         category: str | None = None,
     ) -> CommandResult:
-        self.safety_checker.validate(spec)
+        effective_spec = self._normalize_spec(spec)
+        self.safety_checker.validate(effective_spec)
 
-        resolved_cwd = self._resolve_cwd(spec, cwd)
+        resolved_cwd = self._resolve_cwd(effective_spec, cwd)
         env = os.environ.copy()
-        env.update(spec.env)
+        env.update(effective_spec.env)
         env["PATH"] = self._build_path(env)
-        timeout_seconds = spec.timeout_seconds or self.default_timeout_seconds
+        cache_root = self.artifact_dir / ".tool-cache"
+        cache_root.mkdir(parents=True, exist_ok=True)
+        env.setdefault("XDG_CACHE_HOME", str(cache_root))
+        env.setdefault("UV_CACHE_DIR", str(cache_root / "uv"))
+        env = self._apply_python_environment(env=env, cwd=resolved_cwd)
+        timeout_seconds = effective_spec.timeout_seconds or self.default_timeout_seconds
 
         started_at = datetime.now(UTC)
         started = monotonic()
@@ -99,7 +155,7 @@ class CommandRunner:
 
         try:
             completed = subprocess.run(
-                spec.command,
+                effective_spec.command,
                 cwd=resolved_cwd,
                 env=env,
                 capture_output=True,
@@ -120,13 +176,13 @@ class CommandRunner:
         finished_at = datetime.now(UTC)
         duration_seconds = monotonic() - started
         stdout_artifact, stderr_artifact = self._write_artifacts(
-            command=spec.command,
+            command=effective_spec.command,
             stdout_text=stdout_text,
             stderr_text=stderr_text,
         )
 
         return CommandResult(
-            spec=spec,
+            spec=effective_spec,
             exit_code=exit_code,
             stdout=stdout_text,
             stderr=stderr_text,
@@ -138,6 +194,74 @@ class CommandRunner:
             stderr_artifact=stderr_artifact,
             category=category,
         )
+
+    def _normalize_spec(self, spec: CommandSpec) -> CommandSpec:
+        command = list(spec.command)
+        if self.python_config is not None:
+            rewritten = self._rewrite_python_command(command)
+            return spec.model_copy(update={"command": rewritten})
+        if command[:2] == ["uv", "run"] and len(command) >= 3 and not command[2].startswith("-"):
+            return spec.model_copy(update={"command": command[2:]})
+        return spec
+
+    def _rewrite_python_command(self, command: list[str]) -> list[str]:
+        selected_python = str(self.python_config.selected_python)
+        if not command:
+            return command
+        if command[:2] == ["uv", "run"]:
+            return self._rewrite_uv_run_command(command[2:], selected_python)
+        executable = Path(command[0]).name
+        if executable == "python":
+            return [selected_python, *command[1:]]
+        if executable in _PYTHON_TOOLS:
+            return [selected_python, "-m", executable, *command[1:]]
+        return command
+
+    def _rewrite_uv_run_command(
+        self,
+        command: list[str],
+        selected_python: str,
+    ) -> list[str]:
+        if not command:
+            return ["uv", "run"]
+        executable = Path(command[0]).name
+        if executable == "python":
+            return [selected_python, *command[1:]]
+        if executable in _PYTHON_TOOLS:
+            return [selected_python, "-m", executable, *command[1:]]
+        if executable.startswith("-"):
+            return ["uv", "run", *command]
+        return ["uv", "run", *command]
+
+    def _apply_python_environment(
+        self,
+        *,
+        env: dict[str, str],
+        cwd: Path,
+    ) -> dict[str, str]:
+        if self.python_config is None or self.allowed_cwd_root is None:
+            return env
+        worktree_root = self.allowed_cwd_root
+        worktree_src = worktree_root / "src"
+        safe_paths = [str(worktree_src), str(worktree_root)]
+        existing = env.get("PYTHONPATH", "")
+        filtered_existing = []
+        target_root = self.python_config.target_repo_root.resolve()
+        for entry in existing.split(os.pathsep):
+            if not entry:
+                continue
+            try:
+                resolved = Path(entry).expanduser().resolve()
+            except OSError:
+                filtered_existing.append(entry)
+                continue
+            try:
+                resolved.relative_to(target_root)
+                continue
+            except ValueError:
+                filtered_existing.append(str(resolved))
+        env["PYTHONPATH"] = os.pathsep.join([*safe_paths, *filtered_existing])
+        return env
 
     def _resolve_cwd(self, spec: CommandSpec, cwd: Path | None) -> Path:
         if spec.cwd is None:

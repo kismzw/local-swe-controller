@@ -70,6 +70,16 @@ def test_validate_fixture_repo(temp_fixture_repo: Path) -> None:
     assert before_status == after_status
 
 
+def test_validate_missing_python_fails_clearly(temp_fixture_repo: Path) -> None:
+    result = runner.invoke(
+        app,
+        ["validate", "--repo", str(temp_fixture_repo), "--python", "/does/not/exist/python"],
+    )
+
+    assert result.exit_code == 1
+    assert "Selected Python interpreter does not exist" in result.stderr
+
+
 def test_repair_returns_no_action_needed_and_keeps_repo_clean(
     temp_fixture_repo: Path,
 ) -> None:

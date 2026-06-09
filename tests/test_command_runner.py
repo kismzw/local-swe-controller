@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -7,7 +8,7 @@ import pytest
 
 from local_swe_controller.exceptions import CommandSafetyError
 from local_swe_controller.models import CommandSpec
-from local_swe_controller.sandbox.commands import CommandRunner
+from local_swe_controller.sandbox.commands import CommandRunner, PythonExecutionConfig
 
 
 def test_successful_command(tmp_path: Path) -> None:
@@ -53,6 +54,91 @@ def test_timeout(tmp_path: Path) -> None:
 
     assert result.exit_code == -1
     assert result.timed_out is True
+
+
+def test_uv_run_is_normalized_to_direct_tool_invocation(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    runner = CommandRunner(
+        forbidden_commands=[],
+        artifact_dir=tmp_path,
+        allowed_cwd_root=repo_root,
+        python_config=PythonExecutionConfig(
+            selected_python=Path(sys.executable),
+            target_repo_root=repo_root,
+        ),
+    )
+
+    result = runner.run(
+        CommandSpec(
+            command=["uv", "run", "python", "-c", "print('normalized')"],
+            timeout_seconds=5,
+        ),
+        cwd=repo_root,
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "normalized"
+    assert result.spec.command == [
+        sys.executable,
+        "-c",
+        "print('normalized')",
+    ]
+
+
+def test_uv_run_pytest_is_normalized_under_selected_python(
+    temp_fixture_repo: Path,
+    tmp_path: Path,
+) -> None:
+    runner = CommandRunner(
+        forbidden_commands=[],
+        artifact_dir=tmp_path,
+        allowed_cwd_root=temp_fixture_repo,
+        python_config=PythonExecutionConfig(
+            selected_python=Path(sys.executable),
+            target_repo_root=temp_fixture_repo,
+        ),
+    )
+
+    result = runner.run(
+        CommandSpec(command=["uv", "run", "pytest"], timeout_seconds=30),
+        cwd=temp_fixture_repo,
+    )
+
+    assert result.exit_code == 0
+    assert result.spec.command == [sys.executable, "-m", "pytest"]
+
+
+def test_pythonpath_uses_worktree_paths_without_original_repo_path(tmp_path: Path) -> None:
+    target_repo = tmp_path / "target-repo"
+    target_repo.mkdir()
+    worktree = tmp_path / "worktree"
+    (worktree / "src").mkdir(parents=True)
+    runner = CommandRunner(
+        forbidden_commands=[],
+        artifact_dir=tmp_path / "artifacts",
+        allowed_cwd_root=worktree,
+        python_config=PythonExecutionConfig(
+            selected_python=Path(sys.executable),
+            target_repo_root=target_repo,
+        ),
+    )
+
+    env_spec = CommandSpec(
+        command=[
+            "python",
+            "-c",
+            "import os; print(os.environ.get('PYTHONPATH', ''))",
+        ],
+        env={"PYTHONPATH": os.pathsep.join([str(target_repo), "/tmp/shared"])},
+    )
+    result = runner.run(env_spec, cwd=worktree)
+
+    parts = result.stdout.strip().split(os.pathsep)
+    assert str(worktree / "src") in parts
+    assert str(worktree) in parts
+    assert str(target_repo) not in parts
+    assert "/tmp/shared" in parts
 
 
 def test_forbidden_command(tmp_path: Path) -> None:

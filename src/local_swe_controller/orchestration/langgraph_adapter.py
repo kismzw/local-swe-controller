@@ -196,6 +196,7 @@ class LangGraphRepairAdapter:
         report = self.controller.validation_runner.validate(
             state.repo_path,
             policy=policy,
+            selected_python=state.selected_python,
             artifact_dir=run.log_dir / "baseline",
             keep_worktree=state.keep_worktree,
             timeout_per_command=state.timeout_per_command,
@@ -239,6 +240,7 @@ class LangGraphRepairAdapter:
                 state.timeout_per_command or self._budget_defaults.timeout_seconds
             ),
             keep_worktree=state.keep_worktree,
+            selected_python=state.selected_python,
         )
         self._apply_generated_test_stage(state, stage)
         state.current_node = RepairGraphNode.GENERATE_TESTS
@@ -269,12 +271,18 @@ class LangGraphRepairAdapter:
         route = self.controller.router.resolve(
             "patch_generation",
             profile_name=state.resolved_model_profile,
-            prompt_text=self.controller._build_prompt(
-                repo_root=state.repo_path.resolve(),
-                goal=state.goal,
-                report=baseline_report,
-                iteration=state.iteration,
-            ),
+        )
+        prompt = self.controller._build_prompt(
+            repo_root=state.repo_path.resolve(),
+            goal=state.goal,
+            report=baseline_report,
+            iteration=state.iteration,
+            profile=route.profile,
+        )
+        route = self.controller.router.resolve(
+            "patch_generation",
+            profile_name=route.profile_name,
+            prompt_text=prompt,
             system_prompt=(
                 "You are a deterministic patch proposer. Return only a unified diff patch."
             ),
@@ -293,12 +301,7 @@ class LangGraphRepairAdapter:
             system_prompt=(
                 "You are a deterministic patch proposer. Return only a unified diff patch."
             ),
-            user_prompt=self.controller._build_prompt(
-                repo_root=state.repo_path.resolve(),
-                goal=state.goal,
-                report=baseline_report,
-                iteration=state.iteration,
-            ),
+            user_prompt=prompt,
         )
         patch_path = self.controller.artifact_store.write_patch(run, patch_text)
         self.controller.artifact_store.append_trace(
@@ -381,6 +384,7 @@ class LangGraphRepairAdapter:
             timeout_per_command=(
                 state.timeout_per_command or self._budget_defaults.timeout_seconds
             ),
+            selected_python=state.selected_python,
             pre_patch_paths=pre_patch_paths,
             trace_callback=lambda event, event_payload: self.controller.artifact_store.append_trace(
                 run,

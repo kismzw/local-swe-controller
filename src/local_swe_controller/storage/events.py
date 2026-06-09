@@ -20,6 +20,9 @@ class EventName(str, Enum):
     PATCH_POLICY_CHECKED = "patch_policy_checked"
     PATCH_VALIDATION_STARTED = "patch_validation_started"
     PATCH_VALIDATION_FINISHED = "patch_validation_finished"
+    FORMATTER_REPAIR_STARTED = "formatter_repair_started"
+    FORMATTER_REPAIR_FINISHED = "formatter_repair_finished"
+    FORMATTER_REPAIR_SKIPPED = "formatter_repair_skipped"
     SECURITY_GATE_STARTED = "security_gate_started"
     SECURITY_GATE_FINISHED = "security_gate_finished"
     RUN_FINISHED = "run_finished"
@@ -106,6 +109,7 @@ class PatchPolicyCheckedPayload(BaseModel):
     candidate: int
     accepted: bool
     reasons: list[str] = Field(default_factory=list)
+    source: str | None = None
 
 
 class PatchValidationStartedPayload(BaseModel):
@@ -126,6 +130,30 @@ class PatchValidationFinishedPayload(BaseModel):
     failure_class: str | None = None
     worktree_path: str
     target_repo_changed: bool
+    source: str | None = None
+
+
+class FormatterRepairStartedPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    command: list[str]
+    worktree_path: str
+
+
+class FormatterRepairFinishedPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    command: list[str]
+    exit_code: int
+    stdout_tail: str
+    stderr_tail: str
+
+
+class FormatterRepairSkippedPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str
+    command: list[str]
 
 
 class SecurityGateStartedPayload(BaseModel):
@@ -169,6 +197,9 @@ EVENT_PAYLOAD_MODELS: dict[EventName, type[BaseModel]] = {
     EventName.PATCH_POLICY_CHECKED: PatchPolicyCheckedPayload,
     EventName.PATCH_VALIDATION_STARTED: PatchValidationStartedPayload,
     EventName.PATCH_VALIDATION_FINISHED: PatchValidationFinishedPayload,
+    EventName.FORMATTER_REPAIR_STARTED: FormatterRepairStartedPayload,
+    EventName.FORMATTER_REPAIR_FINISHED: FormatterRepairFinishedPayload,
+    EventName.FORMATTER_REPAIR_SKIPPED: FormatterRepairSkippedPayload,
     EventName.SECURITY_GATE_STARTED: SecurityGateStartedPayload,
     EventName.SECURITY_GATE_FINISHED: SecurityGateFinishedPayload,
     EventName.RUN_FINISHED: RunFinishedPayload,

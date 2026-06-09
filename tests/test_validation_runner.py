@@ -25,6 +25,35 @@ def test_validate_passing_fixture_repo(project_root: Path, temp_fixture_repo: Pa
     assert not (temp_fixture_repo / ".local-swe").exists()
 
 
+def test_validate_uses_selected_python_interpreter(
+    project_root: Path,
+    git_repo_factory,
+    init_git_repo,
+    tmp_path: Path,
+) -> None:
+    repo = git_repo_factory("selected-python")
+    (repo / "README.md").write_text("selected python\n", encoding="utf-8")
+    init_git_repo(repo)
+    policy_path = _write_policy(
+        tmp_path / "selected-python-policy.json",
+        repo,
+        test_commands=[
+            CommandSpec(command=["python", "-c", "import sys; print(sys.executable)"])
+        ],
+    )
+
+    runner = ValidationRunner(project_root / "configs" / "default_policy.yaml")
+    report = runner.validate(repo, policy_path=policy_path, selected_python=Path(sys.executable))
+
+    assert report.status == RunStatus.NO_ACTION_NEEDED
+    assert report.commands[0].spec.command == [
+        sys.executable,
+        "-c",
+        "import sys; print(sys.executable)",
+    ]
+    assert report.commands[0].stdout.strip() == sys.executable
+
+
 def test_validate_failing_repo(project_root: Path, git_repo_factory, init_git_repo) -> None:
     repo = git_repo_factory("failing-repo")
     (repo / "Makefile").write_text("test:\n\tfalse\n", encoding="utf-8")
@@ -200,6 +229,39 @@ def test_validation_keeps_target_repo_unchanged(
     assert report.target_repo_changed is False
     assert before_status == after_status
     assert not (temp_fixture_repo / ".local-swe").exists()
+
+
+def test_validation_environment_summary_mentions_missing_modules_and_manual_setup(
+    project_root: Path,
+    git_repo_factory,
+    init_git_repo,
+    tmp_path: Path,
+) -> None:
+    repo = git_repo_factory("environment-diagnosis")
+    (repo / "src" / "demo_pkg").mkdir(parents=True)
+    (repo / "src" / "demo_pkg" / "__init__.py").write_text("__all__ = []\n", encoding="utf-8")
+    init_git_repo(repo)
+    policy_path = _write_policy(
+        tmp_path / "environment-diagnosis-policy.json",
+        repo,
+        test_commands=[
+            CommandSpec(
+                command=[
+                    "python",
+                    "-c",
+                    "import missing_dep; import demo_pkg",
+                ]
+            )
+        ],
+    )
+
+    runner = ValidationRunner(project_root / "configs" / "default_policy.yaml")
+    report = runner.validate(repo, policy_path=policy_path, selected_python=Path(sys.executable))
+
+    assert report.failure_class == FailureClass.ENVIRONMENT
+    assert report.summary is not None
+    assert "Missing modules: missing_dep" in report.summary
+    assert "Suggested manual setup:" in report.summary
 
 
 def test_validate_does_not_write_artifacts_inside_target_repo_when_cwd_is_target_repo(

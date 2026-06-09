@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-import json
+import re
 import subprocess
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -21,13 +21,129 @@ from local_swe_controller.llm import (
     OpenAICompatibleClient,
     load_model_profiles,
 )
-from local_swe_controller.models import FailureClass, RunStatus, ValidationReport
+from local_swe_controller.models import (
+    CommandResult,
+    CommandSpec,
+    FailureClass,
+    RunStatus,
+    ValidationReport,
+)
 from local_swe_controller.policy.compiler import PolicyCompiler
 from local_swe_controller.policy.schema import CompiledPolicy
 from local_swe_controller.repair.patch_parser import ParsedPatch, PatchParseError, PatchParser
+from local_swe_controller.sandbox.commands import CommandRunner, PythonExecutionConfig
 from local_swe_controller.sandbox.worktree import WorktreeManager
 from local_swe_controller.storage import ArtifactStore, RunContext
 from local_swe_controller.validation.runner import ValidationRunner
+
+_PROMPT_SAFETY_MARGIN_TOKENS = 512
+_PROMPT_DEFAULT_INPUT_TOKENS = 6_000
+_PROMPT_MAX_COMMAND_TAIL_CHARS = 2_000
+_PROMPT_MAX_FILE_CHARS = 8_000
+_PROMPT_MAX_FILES = 12
+_PROMPT_MAX_SUMMARY_FILES = 40
+_EXCLUDED_DIR_NAMES = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".local-swe",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".mypy_cache",
+    ".tox",
+    ".nox",
+    ".cache",
+    "node_modules",
+    "dist",
+    "build",
+    "outputs",
+    "output",
+    "logs",
+    "log",
+    "data",
+    "artifacts",
+    "checkpoints",
+}
+_EXCLUDED_SUFFIXES = {
+    ".ipynb",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".bmp",
+    ".ico",
+    ".pdf",
+    ".zip",
+    ".tar",
+    ".gz",
+    ".tgz",
+    ".xz",
+    ".bz2",
+    ".7z",
+    ".parquet",
+    ".feather",
+    ".arrow",
+    ".sqlite",
+    ".sqlite3",
+    ".db",
+    ".npy",
+    ".npz",
+    ".h5",
+    ".hdf5",
+    ".pt",
+    ".pth",
+    ".ckpt",
+    ".bin",
+    ".so",
+    ".dylib",
+    ".dll",
+    ".pyc",
+}
+_TEXT_FILE_SUFFIXES = {
+    ".py",
+    ".pyi",
+    ".toml",
+    ".md",
+    ".rst",
+    ".txt",
+    ".yml",
+    ".yaml",
+    ".json",
+    ".ini",
+    ".cfg",
+    ".conf",
+    ".env",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".mjs",
+    ".cjs",
+    ".css",
+    ".scss",
+    ".html",
+    ".xml",
+    ".sql",
+    ".rs",
+    ".go",
+    ".java",
+    ".kt",
+    ".c",
+    ".cc",
+    ".cpp",
+    ".h",
+    ".hpp",
+}
+_TRACEBACK_FILE_PATTERN = re.compile(
+    r'File "([^"]+)"|'
+    r'([\w./-]+\.(?:py|pyi|js|jsx|ts|tsx|toml|ya?ml|json|md|rs|go|java|kt|c|cc|cpp|h|hpp))'
+)
 
 
 class RepairResult(BaseModel):
@@ -106,6 +222,7 @@ class RepairController:
         timeout_per_command: int | None = None,
         max_total_runtime_seconds: int | None = None,
         keep_worktree: bool = False,
+        selected_python: Path | None = None,
     ) -> RepairResult:
         repo_root = repo_path.expanduser().resolve()
         budget_defaults = self.validation_runner.default_policy.defaults
@@ -155,6 +272,7 @@ class RepairController:
         baseline_report = self.validation_runner.validate(
             repo_root,
             policy=policy,
+            selected_python=selected_python,
             artifact_dir=run.log_dir / "baseline",
             keep_worktree=keep_worktree,
             timeout_per_command=timeout_per_command,
@@ -211,6 +329,7 @@ class RepairController:
                 max_diff_lines=max_diff_lines,
                 timeout_per_command=timeout_per_command,
                 keep_worktree=keep_worktree,
+                selected_python=selected_python,
             )
             if generated_test_stage.accepted and generated_test_stage.patch_path is not None:
                 pre_patch_paths.append(generated_test_stage.patch_path)
@@ -223,6 +342,22 @@ class RepairController:
             patch_route.profile_name,
             patch_route.profile,
         )
+        formatter_result = self._attempt_formatter_repair(
+            run=run,
+            repo_root=repo_root,
+            goal=goal,
+            policy=policy,
+            policy_path=policy_path,
+            baseline_report=baseline_report,
+            model_profile=patch_route.profile_name,
+            keep_worktree=keep_worktree,
+            timeout_per_command=timeout_per_command,
+            max_diff_lines=max_diff_lines,
+            selected_python=selected_python,
+            generated_test_stage=generated_test_stage,
+        )
+        if formatter_result is not None:
+            return self._finalize(run, formatter_result)
         seen_failures: set[FailureSignature] = set()
         last_failure_report = generated_test_stage.validation_report or baseline_report
         last_result: RepairResult | None = None
@@ -249,6 +384,7 @@ class RepairController:
                 goal=goal,
                 report=last_failure_report,
                 iteration=iteration,
+                profile=patch_route.profile,
             )
             route = self.router.resolve(
                 "patch_generation",
@@ -394,6 +530,7 @@ class RepairController:
                     artifact_dir=run.log_dir / f"candidate-{iteration}-{candidate_index}",
                     keep_worktree=keep_worktree,
                     timeout_per_command=timeout_per_command,
+                    selected_python=selected_python,
                     pre_patch_paths=pre_patch_paths,
                     trace_callback=lambda event, payload: self.artifact_store.append_trace(
                         run, event, payload
@@ -560,49 +697,25 @@ class RepairController:
         goal: str,
         report: ValidationReport,
         iteration: int,
+        profile: ModelProfile,
     ) -> str:
-        file_sections: list[str] = []
-        for path in sorted(repo_root.rglob("*")):
-            if not path.is_file():
-                continue
-            if ".git" in path.parts or ".local-swe" in path.parts:
-                continue
-            if (
-                path.suffix not in {".py", ".toml", ".md", ".yml", ".yaml"}
-                and path.name != "Makefile"
-            ):
-                continue
-            content = path.read_text(encoding="utf-8")
-            file_sections.append(
-                f"FILE: {path.relative_to(repo_root)}\n```text\n{content}\n```"
-            )
-        command_sections = [
-            json.dumps(
-                {
-                    "command": command.spec.command,
-                    "exit_code": command.exit_code,
-                    "stdout": command.stdout,
-                    "stderr": command.stderr,
-                    "category": command.category,
-                },
-                indent=2,
-            )
-            for command in report.commands
-        ]
         retry_guidance = self._retry_guidance(report.failure_class, iteration)
-        return (
+        header = (
             f"Goal: {goal}\n"
             f"Repository: {repo_root}\n"
             f"Repair iteration: {iteration}\n"
-            f"Baseline status: {report.status.value}\n"
+            f"Validation status: {report.status.value}\n"
             f"Failure class: {report.failure_class.value if report.failure_class else 'NONE'}\n"
             "Return exactly one unified diff patch that fixes the failure without changing tests, "
-            "dependencies, CI, policies, or generated artifacts.\n"
-            f"{retry_guidance}\n\n"
-            "Validation evidence:\n"
-            + "\n\n".join(command_sections)
-            + "\n\nRepository files:\n"
-            + "\n\n".join(file_sections)
+            "dependencies, CI, policies, generated artifacts, or unrelated files.\n"
+            f"{retry_guidance}\n"
+        )
+        return self._build_bounded_prompt(
+            repo_root=repo_root,
+            report=report,
+            profile=profile,
+            header=header,
+            mode="patch_generation",
         )
 
     def _build_test_generation_prompt(
@@ -611,47 +724,23 @@ class RepairController:
         repo_root: Path,
         goal: str,
         report: ValidationReport,
+        profile: ModelProfile,
     ) -> str:
-        file_sections: list[str] = []
-        for path in sorted(repo_root.rglob("*")):
-            if not path.is_file():
-                continue
-            if ".git" in path.parts or ".local-swe" in path.parts:
-                continue
-            if (
-                path.suffix not in {".py", ".toml", ".md", ".yml", ".yaml"}
-                and path.name != "Makefile"
-            ):
-                continue
-            content = path.read_text(encoding="utf-8")
-            file_sections.append(
-                f"FILE: {path.relative_to(repo_root)}\n```text\n{content}\n```"
-            )
-        command_sections = [
-            json.dumps(
-                {
-                    "command": command.spec.command,
-                    "exit_code": command.exit_code,
-                    "stdout": command.stdout,
-                    "stderr": command.stderr,
-                    "category": command.category,
-                },
-                indent=2,
-            )
-            for command in report.commands
-        ]
-        return (
+        header = (
             f"Goal: {goal}\n"
             f"Repository: {repo_root}\n"
-            f"Baseline status: {report.status.value}\n"
+            f"Validation status: {report.status.value}\n"
             f"Failure class: {report.failure_class.value if report.failure_class else 'NONE'}\n"
             "Return exactly one unified diff patch containing only regression tests. "
             "Do not modify application code, dependencies, CI, policies, or existing tests. "
-            "Do not skip, xfail, disable, or weaken tests.\n\n"
-            "Failure evidence:\n"
-            + "\n\n".join(command_sections)
-            + "\n\nRepository files:\n"
-            + "\n\n".join(file_sections)
+            "Do not skip, xfail, disable, or weaken tests.\n"
+        )
+        return self._build_bounded_prompt(
+            repo_root=repo_root,
+            report=report,
+            profile=profile,
+            header=header,
+            mode="test_generation",
         )
 
     def _retry_guidance(self, failure_class: FailureClass | None, iteration: int) -> str:
@@ -692,6 +781,7 @@ class RepairController:
         max_diff_lines: int,
         timeout_per_command: int,
         keep_worktree: bool,
+        selected_python: Path | None,
     ) -> GeneratedTestStage:
         if baseline_report.failure_class in {
             FailureClass.SECURITY,
@@ -706,14 +796,17 @@ class RepairController:
                 ],
             )
 
+        route = self.router.resolve("test_generation", profile_name=requested_profile_name)
+        prompt = self._build_test_generation_prompt(
+            repo_root=repo_root,
+            goal=goal,
+            report=baseline_report,
+            profile=route.profile,
+        )
         route = self.router.resolve(
             "test_generation",
-            profile_name=requested_profile_name,
-            prompt_text=self._build_test_generation_prompt(
-                repo_root=repo_root,
-                goal=goal,
-                report=baseline_report,
-            ),
+            profile_name=route.profile_name,
+            prompt_text=prompt,
             system_prompt=(
                 "You generate deterministic regression test patches only. "
                 "Return only a unified diff patch."
@@ -728,11 +821,6 @@ class RepairController:
                 "model_profile": route.profile_name,
                 "estimated_input_tokens": route.estimated_input_tokens,
             },
-        )
-        prompt = self._build_test_generation_prompt(
-            repo_root=repo_root,
-            goal=goal,
-            report=baseline_report,
         )
         patch_text = client.generate_patch(
             system_prompt=(
@@ -804,6 +892,7 @@ class RepairController:
             artifact_dir=run.log_dir / "generated-tests",
             keep_worktree=keep_worktree,
             timeout_per_command=timeout_per_command,
+            selected_python=selected_python,
             trace_callback=lambda event, payload: self.artifact_store.append_trace(
                 run, event, payload
             ),
@@ -869,6 +958,458 @@ class RepairController:
             model_profile=route.profile_name,
         )
 
+    def _build_bounded_prompt(
+        self,
+        *,
+        repo_root: Path,
+        report: ValidationReport,
+        profile: ModelProfile,
+        header: str,
+        mode: str,
+    ) -> str:
+        max_chars = self._prompt_char_budget(profile)
+        sections: list[str] = [header.rstrip(), self._command_evidence(report)]
+        repo_summary = self._repo_summary(repo_root)
+        if repo_summary:
+            sections.append(repo_summary)
+
+        body = "\n\n".join(section for section in sections if section)
+        remaining = max_chars - len(body) - 2
+        if remaining <= 0:
+            return body[:max_chars]
+
+        file_sections: list[str] = []
+        included = 0
+        for path in self._candidate_prompt_files(repo_root, report, mode=mode):
+            if included >= _PROMPT_MAX_FILES:
+                break
+            section = self._file_section(repo_root, path, remaining)
+            if section is None:
+                continue
+            file_sections.append(section)
+            remaining -= len(section) + 2
+            included += 1
+            if remaining <= 0:
+                break
+        if file_sections:
+            body = body + "\n\nRelevant repository files:\n" + "\n\n".join(file_sections)
+        return body[:max_chars]
+
+    def _prompt_char_budget(self, profile: ModelProfile) -> int:
+        if profile.context_window is None:
+            return _PROMPT_DEFAULT_INPUT_TOKENS * 4
+        available_tokens = max(
+            profile.context_window - profile.max_output_tokens - _PROMPT_SAFETY_MARGIN_TOKENS,
+            256,
+        )
+        return available_tokens * 4
+
+    def _command_evidence(self, report: ValidationReport) -> str:
+        sections: list[str] = ["Validation evidence:"]
+        failed_command = self._failed_command(report)
+        if failed_command is not None:
+            sections.append(
+                "Failed command: "
+                + " ".join(failed_command.spec.command)
+                + f" (exit {failed_command.exit_code})"
+            )
+            if failed_command.category:
+                sections.append(f"Failed category: {failed_command.category}")
+        start_index = max(len(report.commands) - 2, 1)
+        for index, command in enumerate(report.commands[-3:], start=start_index):
+            sections.append(
+                f"Command {index}: {' '.join(command.spec.command)} (exit {command.exit_code})"
+            )
+            stdout_tail = self._tail_text(command.stdout, _PROMPT_MAX_COMMAND_TAIL_CHARS)
+            stderr_tail = self._tail_text(command.stderr, _PROMPT_MAX_COMMAND_TAIL_CHARS)
+            if stdout_tail:
+                sections.append(f"stdout tail:\n```text\n{stdout_tail}\n```")
+            if stderr_tail:
+                sections.append(f"stderr tail:\n```text\n{stderr_tail}\n```")
+        if report.summary:
+            sections.append(f"Summary: {report.summary}")
+        return "\n".join(sections)
+
+    def _repo_summary(self, repo_root: Path) -> str:
+        included_files: list[str] = []
+        omitted_count = 0
+        for path in sorted(repo_root.rglob("*")):
+            if not path.is_file():
+                continue
+            if self._should_exclude_from_prompt(repo_root, path):
+                omitted_count += 1
+                continue
+            included_files.append(str(path.relative_to(repo_root)))
+            if len(included_files) >= _PROMPT_MAX_SUMMARY_FILES:
+                break
+        lines = ["Compact repo summary:"]
+        if included_files:
+            lines.append("Candidate text files: " + ", ".join(included_files))
+        if omitted_count:
+            lines.append(
+                "Excluded large or irrelevant paths such as data, outputs, logs, notebooks, "
+                "binaries, caches, virtualenvs, and git metadata."
+            )
+        return "\n".join(lines)
+
+    def _candidate_prompt_files(
+        self,
+        repo_root: Path,
+        report: ValidationReport,
+        *,
+        mode: str,
+    ) -> list[Path]:
+        prioritized: list[Path] = []
+        seen: set[Path] = set()
+        for path in self._traceback_referenced_files(repo_root, report):
+            if path not in seen:
+                prioritized.append(path)
+                seen.add(path)
+
+        priority_prefixes = ["src/", "tests/"] if mode == "patch_generation" else ["tests/", "src/"]
+        priority_names = {"Makefile", "pyproject.toml", "package.json", "Cargo.toml", "README.md"}
+        all_files = sorted(path for path in repo_root.rglob("*") if path.is_file())
+        for prefix in priority_prefixes:
+            for path in all_files:
+                rel = str(path.relative_to(repo_root))
+                if path in seen or self._should_exclude_from_prompt(repo_root, path):
+                    continue
+                if rel.startswith(prefix):
+                    prioritized.append(path)
+                    seen.add(path)
+        for path in all_files:
+            if path in seen or self._should_exclude_from_prompt(repo_root, path):
+                continue
+            if path.name in priority_names:
+                prioritized.append(path)
+                seen.add(path)
+        for path in all_files:
+            if path in seen or self._should_exclude_from_prompt(repo_root, path):
+                continue
+            prioritized.append(path)
+            seen.add(path)
+        return prioritized
+
+    def _traceback_referenced_files(
+        self,
+        repo_root: Path,
+        report: ValidationReport,
+    ) -> list[Path]:
+        candidates: list[Path] = []
+        seen: set[Path] = set()
+        for command in report.commands:
+            for match in _TRACEBACK_FILE_PATTERN.finditer(f"{command.stdout}\n{command.stderr}"):
+                raw = match.group(1) or match.group(2)
+                if not raw:
+                    continue
+                candidate = (
+                    (repo_root / raw).resolve() if not Path(raw).is_absolute() else Path(raw)
+                )
+                try:
+                    resolved = candidate.resolve()
+                    resolved.relative_to(repo_root)
+                except (OSError, ValueError):
+                    continue
+                if resolved.is_file() and resolved not in seen:
+                    candidates.append(resolved)
+                    seen.add(resolved)
+        return candidates
+
+    def _file_section(self, repo_root: Path, path: Path, remaining_chars: int) -> str | None:
+        if remaining_chars < 128:
+            return None
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return None
+        rel = path.relative_to(repo_root)
+        max_content = min(_PROMPT_MAX_FILE_CHARS, max(64, remaining_chars - len(str(rel)) - 32))
+        truncated = content[:max_content]
+        if len(content) > max_content:
+            truncated = truncated + "\n...[truncated]"
+        return f"FILE: {rel}\n```text\n{truncated}\n```"
+
+    def _should_exclude_from_prompt(self, repo_root: Path, path: Path) -> bool:
+        try:
+            rel_parts = path.relative_to(repo_root).parts
+        except ValueError:
+            return True
+        if any(part in _EXCLUDED_DIR_NAMES for part in rel_parts[:-1]):
+            return True
+        if path.suffix.casefold() in _EXCLUDED_SUFFIXES:
+            return True
+        if path.name.startswith(".") and path.name not in {".env", ".flake8"}:
+            return True
+        return path.suffix.casefold() not in _TEXT_FILE_SUFFIXES and path.name not in {
+            "Makefile",
+            "Dockerfile",
+            "Justfile",
+        }
+
+    def _tail_text(self, text: str, max_chars: int) -> str:
+        if len(text) <= max_chars:
+            return text
+        return f"...[truncated]\n{text[-max_chars:]}"
+
+    def _failed_command(self, report: ValidationReport):
+        if not report.commands:
+            return None
+        return report.commands[-1]
+
+    def _attempt_formatter_repair(
+        self,
+        *,
+        run: RunContext,
+        repo_root: Path,
+        goal: str,
+        policy: CompiledPolicy,
+        policy_path: Path,
+        baseline_report: ValidationReport,
+        model_profile: str,
+        keep_worktree: bool,
+        timeout_per_command: int,
+        max_diff_lines: int,
+        selected_python: Path | None,
+        generated_test_stage: GeneratedTestStage,
+    ) -> RepairResult | None:
+        if baseline_report.failure_class != FailureClass.FORMAT:
+            return None
+        failed_command = self._failed_command(baseline_report)
+        if failed_command is None:
+            return None
+        write_command = self._derive_formatter_write_command(failed_command.spec.command)
+        if write_command is None:
+            self.artifact_store.append_trace(
+                run,
+                "formatter_repair_skipped",
+                {"reason": "unsupported_formatter_command", "command": failed_command.spec.command},
+            )
+            return None
+
+        manager = WorktreeManager(keep_worktree=keep_worktree)
+        with manager.session(repo_root) as managed:
+            self.artifact_store.append_trace(
+                run,
+                "formatter_repair_started",
+                {"command": write_command, "worktree_path": str(managed.path)},
+            )
+            try:
+                result = self._run_formatter_command(
+                    worktree_path=managed.path,
+                    repo_root=repo_root,
+                    command=write_command,
+                    cwd=failed_command.spec.cwd,
+                    env=failed_command.spec.env,
+                    timeout_seconds=failed_command.spec.timeout_seconds or timeout_per_command,
+                    selected_python=selected_python,
+                    forbidden_commands=policy.forbidden_commands,
+                    artifact_dir=run.log_dir / "formatter-command",
+                )
+            except subprocess.TimeoutExpired:
+                self.artifact_store.append_trace(
+                    run,
+                    "formatter_repair_skipped",
+                    {"reason": "formatter_write_timed_out", "command": write_command},
+                )
+                return None
+            self.artifact_store.append_trace(
+                run,
+                "formatter_repair_finished",
+                {
+                    "command": write_command,
+                    "exit_code": result.exit_code,
+                    "stdout_tail": self._tail_text(result.stdout, 500),
+                    "stderr_tail": self._tail_text(result.stderr, 500),
+                },
+            )
+            if result.exit_code != 0:
+                return None
+
+            diff_text = self._git_diff(managed.path)
+            if not diff_text.strip():
+                self.artifact_store.append_trace(
+                    run,
+                    "formatter_repair_skipped",
+                    {"reason": "no_diff_after_formatter", "command": write_command},
+                )
+                return None
+
+            patch_path = self.artifact_store.write_patch(run, diff_text)
+            try:
+                parsed_patch = self.patch_parser.parse(diff_text)
+            except PatchParseError:
+                return None
+
+            check = self.patch_parser.check(
+                parsed_patch,
+                policy=policy,
+                max_diff_lines=max_diff_lines,
+            )
+            self.artifact_store.append_trace(
+                run,
+                "patch_policy_checked",
+                {
+                    "iteration": 0,
+                    "candidate": 0,
+                    "accepted": check.accepted,
+                    "reasons": check.reasons,
+                    "source": "formatter_repair",
+                },
+            )
+            if not check.accepted:
+                return None
+
+            validation_report = self.validation_runner.validate_worktree(
+                repo_root=repo_root,
+                policy=policy,
+                worktree_path=managed.path,
+                selected_python=selected_python,
+                artifact_dir=run.log_dir / "formatter-repair",
+                timeout_per_command=timeout_per_command,
+                trace_callback=lambda event, payload: self.artifact_store.append_trace(
+                    run, event, payload
+                ),
+                phase="formatter-repair",
+            )
+            self.artifact_store.append_trace(
+                run,
+                "patch_validation_finished",
+                {
+                    "iteration": 0,
+                    "candidate": 0,
+                    "status": validation_report.status.value,
+                    "failure_class": (
+                        validation_report.failure_class.value
+                        if validation_report.failure_class
+                        else None
+                    ),
+                    "worktree_path": str(managed.path),
+                    "target_repo_changed": validation_report.target_repo_changed,
+                    "source": "formatter_repair",
+                },
+            )
+            if validation_report.status == RunStatus.NO_ACTION_NEEDED:
+                return RepairResult(
+                    run_id=run.run_id,
+                    repo_root=repo_root,
+                    goal=goal,
+                    status=RunStatus.SUCCESS,
+                    summary="Formatter auto-repair succeeded in an isolated worktree.",
+                    model_profile=model_profile,
+                    artifact_dir=run.artifact_dir,
+                    policy_path=policy_path,
+                    trace_path=run.trace_path,
+                    summary_path=run.summary_path,
+                    patch_path=patch_path,
+                    generated_test_patch_path=generated_test_stage.patch_path,
+                    baseline_report=baseline_report,
+                    generated_test_validation_report=generated_test_stage.validation_report,
+                    validation_report=validation_report,
+                    generated_test_rejection_reasons=(
+                        generated_test_stage.rejection_reasons or []
+                    ),
+                    worktree_path=managed.path,
+                    target_repo_changed=False,
+                    iterations_attempted=0,
+                    candidates_attempted=0,
+                    stop_reason="formatter_validation_passed",
+                )
+            return self._stop_for_terminal_failure(
+                run=run,
+                repo_root=repo_root,
+                goal=goal,
+                policy_path=policy_path,
+                baseline_report=baseline_report,
+                model_profile=model_profile,
+                validation_report=validation_report,
+                patch_path=patch_path,
+                generated_test_patch_path=generated_test_stage.patch_path,
+                worktree_path=managed.path,
+                iterations_attempted=0,
+                candidates_attempted=0,
+                generated_test_validation_report=generated_test_stage.validation_report,
+                generated_test_rejection_reasons=generated_test_stage.rejection_reasons or [],
+            )
+
+    def _derive_formatter_write_command(self, command: list[str]) -> list[str] | None:
+        normalized = list(command)
+        if len(normalized) >= 5 and normalized[1:4] == ["-m", "ruff", "format"]:
+            return [normalized[0], "-m", "ruff", "format", *normalized[5:]]
+        if len(normalized) >= 4 and normalized[1:3] == ["-m", "black"] and "--check" in normalized:
+            return [normalized[0], "-m", *[part for part in normalized[2:] if part != "--check"]]
+        if normalized[:2] == ["uv", "run"]:
+            prefix: list[str] = []
+            tool = normalized[2:]
+        else:
+            prefix = []
+            tool = normalized
+        if tool in (["make", "format-check"], ["gmake", "format-check"]):
+            return [tool[0], "format"]
+        if tool[:3] == ["ruff", "format", "--check"]:
+            return [*prefix, "ruff", "format", *tool[3:]]
+        if tool and tool[0] == "black" and "--check" in tool:
+            return [*prefix, *[part for part in tool if part != "--check"]]
+        if tool and tool[0] == "prettier" and "--check" in tool:
+            replaced = ["--write" if part == "--check" else part for part in tool]
+            return [*prefix, *replaced]
+        if len(tool) >= 2 and tool[:2] == ["biome", "format"] and "--check" in tool:
+            if "--write" in tool:
+                return [*prefix, *[part for part in tool if part != "--check"]]
+            return [*prefix, *["--write" if part == "--check" else part for part in tool]]
+        return None
+
+    def _run_formatter_command(
+        self,
+        *,
+        worktree_path: Path,
+        repo_root: Path,
+        command: list[str],
+        cwd: str | None,
+        env: dict[str, str],
+        timeout_seconds: int,
+        selected_python: Path | None,
+        forbidden_commands: list[str],
+        artifact_dir: Path,
+    ) -> CommandResult:
+        runner = CommandRunner(
+            forbidden_commands=forbidden_commands,
+            artifact_dir=artifact_dir,
+            default_timeout_seconds=timeout_seconds,
+            allowed_cwd_root=worktree_path,
+            python_config=(
+                PythonExecutionConfig(
+                    selected_python=selected_python,
+                    target_repo_root=repo_root.resolve(),
+                )
+                if selected_python is not None
+                else None
+            ),
+        )
+        return runner.run(
+            CommandSpec(
+                command=command,
+                cwd=cwd,
+                env=env,
+                timeout_seconds=timeout_seconds,
+                description="Formatter auto-repair",
+            ),
+            cwd=worktree_path,
+            category="format",
+        )
+
+    def _git_diff(self, worktree_path: Path) -> str:
+        result = subprocess.run(
+            ["git", "-C", str(worktree_path), "diff", "--binary"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise ValidationError(
+                result.stderr.strip() or result.stdout.strip() or "git diff failed"
+            )
+        return result.stdout
+
     def _generated_test_patch_rejection_reasons(
         self,
         parsed_patch: ParsedPatch,
@@ -932,6 +1473,7 @@ class RepairController:
         artifact_dir: Path,
         keep_worktree: bool,
         timeout_per_command: int,
+        selected_python: Path | None = None,
         pre_patch_paths: list[Path] | None = None,
         trace_callback=None,
         phase: str = "patch",
@@ -945,6 +1487,7 @@ class RepairController:
                 repo_root=repo_root,
                 policy=policy,
                 worktree_path=managed.path,
+                selected_python=selected_python,
                 artifact_dir=artifact_dir,
                 timeout_per_command=timeout_per_command,
                 trace_callback=trace_callback,

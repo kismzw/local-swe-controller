@@ -21,7 +21,7 @@ from local_swe_controller.models import (
 )
 from local_swe_controller.policy.compiler import PolicyCompiler
 from local_swe_controller.policy.schema import CompiledPolicy
-from local_swe_controller.sandbox.commands import CommandRunner
+from local_swe_controller.sandbox.commands import CommandRunner, PythonExecutionConfig
 from local_swe_controller.sandbox.worktree import ManagedWorktree, WorktreeManager
 from local_swe_controller.storage import ArtifactStore, RunContext
 from local_swe_controller.storage.manager import default_artifact_root
@@ -46,6 +46,7 @@ class ValidationRunner:
         *,
         policy_path: Path | None = None,
         policy: CompiledPolicy | None = None,
+        selected_python: Path | None = None,
         artifact_dir: Path | None = None,
         keep_worktree: bool = False,
         timeout_per_command: int | None = None,
@@ -59,6 +60,7 @@ class ValidationRunner:
             return self._run_policy(
                 policy=policy,
                 worktree_path=managed.path,
+                selected_python=selected_python,
                 artifact_dir=artifact_dir,
                 target_repo_dirty=managed.target_repo_dirty,
                 target_repo_state=lambda: self._target_repo_changed(worktree_manager, managed),
@@ -74,6 +76,7 @@ class ValidationRunner:
         repo_root: Path,
         policy: CompiledPolicy,
         worktree_path: Path,
+        selected_python: Path | None = None,
         artifact_dir: Path | None = None,
         timeout_per_command: int | None = None,
         trace_callback: Callable[[str, dict[str, object]], None] | None = None,
@@ -82,6 +85,7 @@ class ValidationRunner:
         return self._run_policy(
             policy=policy,
             worktree_path=worktree_path,
+            selected_python=selected_python,
             artifact_dir=artifact_dir,
             target_repo_dirty=self._target_repo_dirty(repo_root),
             target_repo_state=lambda: False,
@@ -96,6 +100,7 @@ class ValidationRunner:
         repo_path: Path,
         *,
         policy_path: Path | None = None,
+        selected_python: Path | None = None,
         keep_worktree: bool = False,
         timeout_per_command: int | None = None,
         artifact_store: ArtifactStore | None = None,
@@ -129,6 +134,7 @@ class ValidationRunner:
         report = self.validate(
             repo_root,
             policy=policy,
+            selected_python=selected_python,
             artifact_dir=run.log_dir / "validation",
             keep_worktree=keep_worktree,
             timeout_per_command=timeout_per_command,
@@ -219,6 +225,7 @@ class ValidationRunner:
         *,
         policy: CompiledPolicy,
         worktree_path: Path,
+        selected_python: Path | None,
         artifact_dir: Path | None,
         target_repo_dirty: bool,
         target_repo_state: Callable[[], bool],
@@ -235,6 +242,14 @@ class ValidationRunner:
                 timeout_per_command or self.default_policy.defaults.timeout_seconds
             ),
             allowed_cwd_root=worktree_path,
+            python_config=(
+                PythonExecutionConfig(
+                    selected_python=selected_python,
+                    target_repo_root=policy.repo_root.resolve(),
+                )
+                if selected_python is not None
+                else None
+            ),
         )
         warnings = [warning] if warning else []
         if (
@@ -276,6 +291,8 @@ class ValidationRunner:
                         spec=spec,
                         result=result,
                         policy=policy,
+                        worktree_path=worktree_path,
+                        selected_python=selected_python,
                     )
                     if category == "security":
                         self._trace(
@@ -376,12 +393,25 @@ class ValidationRunner:
         category: str,
         result: CommandResult,
         failure_class: FailureClass,
+        worktree_path: Path,
+        selected_python: Path | None,
     ) -> str:
         if result.timed_out:
             return (
                 f"{category} command timed out after {result.duration_seconds:.2f}s "
                 f"and was classified as {failure_class.value}."
             )
+        if failure_class == FailureClass.ENVIRONMENT:
+            diagnosis = self._environment_diagnosis(
+                result=result,
+                worktree_path=worktree_path,
+                selected_python=selected_python,
+            )
+            if diagnosis is not None:
+                return (
+                    f"{category} command exited with code {result.exit_code} and was classified "
+                    f"as {failure_class.value}. {diagnosis}"
+                )
         return (
             f"{category} command exited with code {result.exit_code} and was classified as "
             f"{failure_class.value}."
@@ -394,6 +424,8 @@ class ValidationRunner:
         spec: CommandSpec,
         result: CommandResult,
         policy: CompiledPolicy,
+        worktree_path: Path,
+        selected_python: Path | None,
     ) -> dict[str, object]:
         gate_mode = self._gate_mode(category, policy)
         if spec.optional and self._is_missing_tool(result):
@@ -420,10 +452,77 @@ class ValidationRunner:
             return {"action": "continue"}
 
         failure_class = self.classifier.classify(result)
-        summary = self._build_summary(category, result, failure_class)
+        summary = self._build_summary(
+            category,
+            result,
+            failure_class,
+            worktree_path,
+            selected_python,
+        )
         if gate_mode == "soft":
             return {"action": "warn", "summary": summary}
         return {"action": "fail", "summary": summary, "failure_class": failure_class}
+
+    def _environment_diagnosis(
+        self,
+        *,
+        result: CommandResult,
+        worktree_path: Path,
+        selected_python: Path | None,
+    ) -> str | None:
+        output = f"{result.stdout}\n{result.stderr}"
+        lowered = output.casefold()
+        missing_modules = self._missing_modules(output)
+        details: list[str] = []
+        if missing_modules:
+            details.append(
+                "Missing modules: " + ", ".join(sorted(missing_modules))
+            )
+        if "modulenotfounderror" in lowered or "no module named" in lowered:
+            if self._target_package_not_importable(output, worktree_path):
+                details.append(
+                    "The target package may not be importable from the selected interpreter."
+                )
+            interpreter_hint = (
+                f"the selected interpreter ({selected_python})"
+                if selected_python is not None
+                else "a prepared project interpreter"
+            )
+            details.append(
+                "Suggested manual setup: pass --python or --venv pointing to "
+                f"{interpreter_hint} with this repo's dependencies already installed. "
+                "local-swe does not install dependencies automatically."
+            )
+        if not details:
+            return None
+        return " ".join(details)
+
+    def _missing_modules(self, output: str) -> set[str]:
+        import re
+
+        patterns = (
+            re.compile(r"No module named ['\"]([^'\"]+)['\"]"),
+            re.compile(r"ModuleNotFoundError:\s+No module named ['\"]([^'\"]+)['\"]"),
+        )
+        found: set[str] = set()
+        for pattern in patterns:
+            for match in pattern.findall(output):
+                if match:
+                    found.add(match)
+        return found
+
+    def _target_package_not_importable(self, output: str, worktree_path: Path) -> bool:
+        repo_packages = set()
+        src_dir = worktree_path / "src"
+        if src_dir.is_dir():
+            for child in src_dir.iterdir():
+                if child.is_dir() and (child / "__init__.py").exists():
+                    repo_packages.add(child.name)
+        for child in worktree_path.iterdir():
+            if child.is_dir() and (child / "__init__.py").exists():
+                repo_packages.add(child.name)
+        missing = self._missing_modules(output)
+        return any(module.split(".", 1)[0] in repo_packages for module in missing)
 
     def _policy_violation_result(self, exc: CommandSafetyError) -> CommandResult:
         return CommandResult(

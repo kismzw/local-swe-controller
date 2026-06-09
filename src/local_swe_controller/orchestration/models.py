@@ -53,6 +53,7 @@ class RepairGraphState(BaseModel):
     repo_path: Path
     goal: str
     model_profile_name: str | None = None
+    selected_python: Path | None = None
     generate_tests: bool = False
     max_iters: int = Field(ge=1, default=1)
     max_candidates: int | None = Field(default=None, ge=1)

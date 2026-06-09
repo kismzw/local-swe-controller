@@ -24,6 +24,7 @@ from local_swe_controller.orchestration.langgraph_adapter import LangGraphRepair
 from local_swe_controller.policy.compiler import PolicyCompiler
 from local_swe_controller.pr import PRService
 from local_swe_controller.repair.controller import RepairController
+from local_swe_controller.sandbox.commands import resolve_selected_python
 from local_swe_controller.storage import ArtifactStore
 from local_swe_controller.validation.runner import ValidationRunner
 
@@ -117,6 +118,14 @@ def validate(
         bool,
         typer.Option(help="Keep the ephemeral worktree after validation."),
     ] = False,
+    python_path: Annotated[
+        Path | None,
+        typer.Option("--python", help="Python interpreter to use inside worktrees."),
+    ] = None,
+    venv_path: Annotated[
+        Path | None,
+        typer.Option("--venv", help="Virtualenv whose bin/python should be used inside worktrees."),
+    ] = None,
     json_output: Annotated[
         bool,
         typer.Option("--json", help="Print the validation report as JSON."),
@@ -127,9 +136,14 @@ def validate(
     runner = ValidationRunner(default_policy_path=_default_policy_path())
 
     try:
+        selected_python = resolve_selected_python(
+            python_path=python_path,
+            venv_path=venv_path,
+        )
         report, run = runner.validate_and_record(
             repo,
             policy_path=policy,
+            selected_python=selected_python,
             keep_worktree=keep_worktree,
             artifact_store=ArtifactStore(),
         )
@@ -209,6 +223,14 @@ def repair(
         bool,
         typer.Option(help="Keep the ephemeral candidate worktree after repair."),
     ] = False,
+    python_path: Annotated[
+        Path | None,
+        typer.Option("--python", help="Python interpreter to use inside worktrees."),
+    ] = None,
+    venv_path: Annotated[
+        Path | None,
+        typer.Option("--venv", help="Virtualenv whose bin/python should be used inside worktrees."),
+    ] = None,
     orchestrator: Annotated[
         str,
         typer.Option(help="Repair orchestrator to use: deterministic or langgraph."),
@@ -227,6 +249,10 @@ def repair(
     )
 
     try:
+        selected_python = resolve_selected_python(
+            python_path=python_path,
+            venv_path=venv_path,
+        )
         if orchestrator == "deterministic":
             result = controller.repair(
                 repo_path=repo,
@@ -239,6 +265,7 @@ def repair(
                 timeout_per_command=timeout_per_command,
                 max_total_runtime_seconds=max_total_runtime_seconds,
                 keep_worktree=keep_worktree,
+                selected_python=selected_python,
             )
         elif orchestrator == "langgraph":
             adapter = LangGraphRepairAdapter(controller)
@@ -256,6 +283,7 @@ def repair(
                     timeout_per_command=timeout_per_command,
                     max_total_runtime_seconds=max_total_runtime_seconds,
                     keep_worktree=keep_worktree,
+                    selected_python=selected_python,
                 )
             )
         else:
