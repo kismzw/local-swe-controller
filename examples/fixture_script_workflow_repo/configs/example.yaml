@@ -1,0 +1,2 @@
+dataset_root: ./example-data
+checkpoint: ./example.ckpt

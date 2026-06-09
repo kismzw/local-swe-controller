@@ -644,6 +644,31 @@ def test_generated_test_patch_rejected_if_it_touches_forbidden_paths(
     assert _git_status(repo) == ""
 
 
+def test_implicit_workflow_prompt_prefers_readme_only_and_forbids_unsafe_cli_boilerplate(
+    project_root: Path,
+    temp_script_workflow_repo: Path,
+    tmp_path: Path,
+) -> None:
+    controller = _controller(project_root, tmp_path)
+    policy = controller.policy_compiler.compile(temp_script_workflow_repo)
+    report = controller.validation_runner.validate(temp_script_workflow_repo, policy=policy)
+    route = controller.router.resolve("patch_generation", profile_name="fake")
+
+    prompt = controller._build_prompt(
+        repo_root=temp_script_workflow_repo,
+        goal="Improve workflow readability without changing behavior",
+        report=report,
+        iteration=1,
+        profile=route.profile,
+        policy=policy,
+    )
+
+    assert "First candidate should prefer README or documentation-only workflow fixes" in prompt
+    assert "Do not add argparse to library, helper, or model modules" in prompt
+    assert "Do not add parse_args() at module import time" in prompt
+    assert 'parser.add_argument("--help"' in prompt
+
+
 def _controller(project_root: Path, tmp_path: Path) -> RepairController:
     return RepairController(
         default_policy_path=project_root / "configs" / "default_policy.yaml",

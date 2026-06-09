@@ -12,18 +12,24 @@ from typing import Any
 
 from local_swe_controller.config import DefaultPolicyConfig, load_config
 from local_swe_controller.exceptions import PolicyCompileError
-from local_swe_controller.models import CommandSpec
+from local_swe_controller.models import CommandSeverity, CommandSpec, MissingToolBehavior
+from local_swe_controller.policy.profiler import RepoProfiler
 from local_swe_controller.policy.schema import CompiledPolicy
 
 
 @dataclass(slots=True)
 class RepoInspection:
     repo_root: Path
+    repo_kind: str
+    workflow_sources: list[str]
     source_files: list[Path]
     pyproject: dict[str, Any] | None
     package_json: dict[str, Any] | None
     cargo_toml: dict[str, Any] | None
     make_targets: set[str]
+    readme_commands: list[CommandSpec]
+    scripts_by_language: dict[str, list[Path]]
+    workflow_files: list[Path]
 
 
 class PolicyCompiler:
@@ -32,6 +38,7 @@ class PolicyCompiler:
     def __init__(self, default_policy_path: Path) -> None:
         self.default_policy_path = default_policy_path
         self.default_policy = load_config(default_policy_path, DefaultPolicyConfig)
+        self.repo_profiler = RepoProfiler()
 
     def compile(self, repo_path: Path) -> CompiledPolicy:
         repo_root = repo_path.expanduser().resolve()
@@ -42,6 +49,7 @@ class PolicyCompiler:
 
         inspection = self._inspect_repo(repo_root)
         setup_commands = self._infer_setup_commands(inspection)
+        build_commands = self._infer_build_commands(inspection)
         format_commands = self._prefer_make_targets(
             inspection,
             inferred=self._infer_python_format_commands(inspection)
@@ -69,6 +77,8 @@ class PolicyCompiler:
             + self._infer_cargo_test_commands(inspection),
             target_names=["test", "test-fast"],
         )
+        smoke_commands = self._infer_smoke_commands(inspection)
+        e2e_commands = self._infer_e2e_commands(inspection)
         security_commands = self._merge_make_targets(
             inspection,
             inferred=self._infer_security_commands(inspection),
@@ -77,13 +87,18 @@ class PolicyCompiler:
 
         return CompiledPolicy(
             repo_root=inspection.repo_root,
+            repo_kind=inspection.repo_kind,
+            workflow_sources=inspection.workflow_sources,
             policy_version=self.default_policy.policy_version,
             source_files=inspection.source_files,
             setup_commands=setup_commands,
             format_commands=format_commands,
             lint_commands=lint_commands,
             typecheck_commands=typecheck_commands,
+            build_commands=build_commands,
             test_commands=test_commands,
+            smoke_commands=smoke_commands,
+            e2e_commands=e2e_commands,
             security_commands=security_commands,
             hard_gates=self.default_policy.hard_gates,
             soft_gates=self.default_policy.soft_gates,
@@ -101,6 +116,7 @@ class PolicyCompiler:
 
     def _inspect_repo(self, repo_root: Path) -> RepoInspection:
         source_files: list[Path] = []
+        profile = self.repo_profiler.profile(repo_root)
         pyproject = self._load_toml(repo_root / "pyproject.toml", source_files)
         package_json = self._load_json(repo_root / "package.json", source_files)
         cargo_toml = self._load_toml(repo_root / "Cargo.toml", source_files)
@@ -111,17 +127,20 @@ class PolicyCompiler:
             if candidate.is_file():
                 source_files.append(candidate)
 
-        workflow_dir = repo_root / ".github" / "workflows"
-        if workflow_dir.is_dir():
-            source_files.extend(sorted(workflow_dir.glob("*.yml")))
+        source_files.extend(profile.workflow_files)
 
         return RepoInspection(
             repo_root=repo_root,
-            source_files=sorted(source_files),
+            repo_kind=profile.repo_kind,
+            workflow_sources=profile.workflow_sources,
+            source_files=sorted(set(source_files)),
             pyproject=pyproject,
             package_json=package_json,
             cargo_toml=cargo_toml,
             make_targets=make_targets,
+            readme_commands=profile.readme_commands,
+            scripts_by_language=profile.scripts_by_language,
+            workflow_files=profile.workflow_files,
         )
 
     def _load_toml(self, path: Path, source_files: list[Path]) -> dict[str, Any] | None:
@@ -150,6 +169,8 @@ class PolicyCompiler:
 
     def _infer_setup_commands(self, inspection: RepoInspection) -> list[CommandSpec]:
         commands: list[CommandSpec] = []
+        if inspection.repo_kind == "script_collection":
+            return commands
         if inspection.pyproject is not None:
             commands.append(
                 CommandSpec(
@@ -172,6 +193,29 @@ class PolicyCompiler:
                 )
             )
         return commands
+
+    def _infer_build_commands(self, inspection: RepoInspection) -> list[CommandSpec]:
+        if inspection.repo_kind == "script_collection":
+            syntax_commands, _ = self.repo_profiler.script_validation_commands(
+                inspection.repo_root,
+                inspection.scripts_by_language,
+            )
+            return self._dedupe_commands(syntax_commands)
+        if "implicit_script_chain" in inspection.workflow_sources:
+            syntax_commands, _ = self.repo_profiler.script_validation_commands(
+                inspection.repo_root,
+                inspection.scripts_by_language,
+            )
+            return self._dedupe_commands(syntax_commands)
+        commands = self._prefer_make_targets(
+            inspection,
+            inferred=self._infer_package_json_commands(inspection, "build"),
+            target_names=["build", "compile"],
+        )
+        if inspection.repo_kind == "workflow_repo":
+            commands.extend(self._workflow_commands_from_readme(inspection, phases={"build"}))
+            commands.extend(self._workflow_commands_from_signals(inspection, phases={"build"}))
+        return self._dedupe_commands(commands)
 
     def _infer_python_format_commands(self, inspection: RepoInspection) -> list[CommandSpec]:
         tool = self._pyproject_tool_section(inspection.pyproject)
@@ -217,6 +261,8 @@ class PolicyCompiler:
         return commands
 
     def _infer_python_test_commands(self, inspection: RepoInspection) -> list[CommandSpec]:
+        if inspection.repo_kind == "script_collection":
+            return []
         if inspection.pyproject is None:
             return []
         dependencies = self._flatten_pyproject_dependencies(inspection.pyproject)
@@ -238,6 +284,43 @@ class PolicyCompiler:
                 )
             )
         commands.extend(self._infer_optional_security_scanners(inspection))
+        return self._dedupe_commands(commands)
+
+    def _infer_smoke_commands(self, inspection: RepoInspection) -> list[CommandSpec]:
+        if inspection.repo_kind == "script_collection":
+            _, smoke_commands = self.repo_profiler.script_validation_commands(
+                inspection.repo_root,
+                inspection.scripts_by_language,
+            )
+            return self._dedupe_commands(smoke_commands)
+        if "implicit_script_chain" in inspection.workflow_sources:
+            _, smoke_commands = self.repo_profiler.script_validation_commands(
+                inspection.repo_root,
+                inspection.scripts_by_language,
+                smoke_severity=CommandSeverity.SOFT,
+            )
+            return self._dedupe_commands(smoke_commands)
+
+        commands = self._prefer_make_targets(
+            inspection,
+            inferred=[],
+            target_names=["smoke", "run-smoke", "check", "dry-run"],
+        )
+        if inspection.repo_kind == "workflow_repo":
+            commands.extend(self._workflow_commands_from_signals(inspection, phases={"smoke"}))
+            commands.extend(self._workflow_commands_from_readme(inspection, phases={"smoke"}))
+        return self._dedupe_commands(commands)
+
+    def _infer_e2e_commands(self, inspection: RepoInspection) -> list[CommandSpec]:
+        if inspection.repo_kind != "workflow_repo":
+            return []
+        commands = self._prefer_make_targets(
+            inspection,
+            inferred=[],
+            target_names=["e2e", "integration", "workflow"],
+        )
+        commands.extend(self._workflow_commands_from_signals(inspection, phases={"e2e"}))
+        commands.extend(self._workflow_commands_from_readme(inspection, phases={"e2e"}))
         return self._dedupe_commands(commands)
 
     def _infer_optional_security_scanners(self, inspection: RepoInspection) -> list[CommandSpec]:
@@ -342,6 +425,92 @@ class PolicyCompiler:
                 break
         commands.extend(inferred)
         return self._dedupe_commands(commands)
+
+    def _workflow_commands_from_signals(
+        self,
+        inspection: RepoInspection,
+        *,
+        phases: set[str],
+    ) -> list[CommandSpec]:
+        commands: list[CommandSpec] = []
+        repo_root = inspection.repo_root
+        if "smoke" in phases and (repo_root / "Snakefile").is_file():
+            commands.append(
+                CommandSpec(
+                    command=["snakemake", "-n"],
+                    description="Snakemake dry-run",
+                    optional=True,
+                    tool_name="snakemake",
+                    missing_tool_behavior=MissingToolBehavior.SKIP,
+                )
+            )
+        if "smoke" in phases and (repo_root / "snakefile").is_file():
+            commands.append(
+                CommandSpec(
+                    command=["snakemake", "-n", "-s", "snakefile"],
+                    description="Snakemake dry-run",
+                    optional=True,
+                    tool_name="snakemake",
+                    missing_tool_behavior=MissingToolBehavior.SKIP,
+                )
+            )
+        if "smoke" in phases and (repo_root / "main.nf").is_file():
+            commands.append(
+                CommandSpec(
+                    command=["nextflow", "run", "main.nf", "-stub-run"],
+                    description="Nextflow stub run",
+                    optional=True,
+                    tool_name="nextflow",
+                    missing_tool_behavior=MissingToolBehavior.SKIP,
+                )
+            )
+        if "e2e" in phases and (repo_root / "main.nf").is_file():
+            commands.append(
+                CommandSpec(
+                    command=["nextflow", "run", "main.nf", "-stub-run"],
+                    description="Nextflow workflow run",
+                    optional=True,
+                    tool_name="nextflow",
+                    missing_tool_behavior=MissingToolBehavior.SKIP,
+                )
+            )
+        if "build" in phases and "build" in self._package_scripts(inspection.package_json):
+            commands.append(CommandSpec(command=["npm", "run", "build"], description="build"))
+        return commands
+
+    def _workflow_commands_from_readme(
+        self,
+        inspection: RepoInspection,
+        *,
+        phases: set[str],
+    ) -> list[CommandSpec]:
+        commands: list[CommandSpec] = []
+        for command in inspection.readme_commands:
+            argv = command.command
+            if not argv:
+                continue
+            text = " ".join(argv).casefold()
+            if "smoke" in phases and self._is_safe_smoke_command(argv, text):
+                commands.append(command.model_copy(update={"description": "README smoke command"}))
+            elif "e2e" in phases and self._is_safe_e2e_command(argv, text):
+                commands.append(command.model_copy(update={"description": "README e2e command"}))
+            elif "build" in phases and self._is_build_command(argv, text):
+                commands.append(command.model_copy(update={"description": "README build command"}))
+        return commands
+
+    def _is_safe_smoke_command(self, argv: list[str], text: str) -> bool:
+        return any(
+            marker in text
+            for marker in ("--help", "-h", "--dry-run", "-n", "smoke", "check")
+        ) or argv[0] in {"snakemake", "nextflow"}
+
+    def _is_safe_e2e_command(self, argv: list[str], text: str) -> bool:
+        return any(marker in text for marker in ("e2e", "workflow", "pipeline", "run"))
+
+    def _is_build_command(self, argv: list[str], text: str) -> bool:
+        return argv[:2] == ["make", "build"] or any(
+            marker in text for marker in ("build", "compile")
+        )
 
     def _dedupe_commands(self, commands: list[CommandSpec]) -> list[CommandSpec]:
         deduped: list[CommandSpec] = []

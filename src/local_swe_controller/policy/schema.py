@@ -17,13 +17,18 @@ class CompiledPolicy(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     repo_root: Path
+    repo_kind: str = "unknown"
+    workflow_sources: list[str] = Field(default_factory=list)
     policy_version: str
     source_files: list[Path] = Field(default_factory=list)
     setup_commands: list[CommandSpec] = Field(default_factory=list)
     format_commands: list[CommandSpec] = Field(default_factory=list)
     lint_commands: list[CommandSpec] = Field(default_factory=list)
     typecheck_commands: list[CommandSpec] = Field(default_factory=list)
+    build_commands: list[CommandSpec] = Field(default_factory=list)
     test_commands: list[CommandSpec] = Field(default_factory=list)
+    smoke_commands: list[CommandSpec] = Field(default_factory=list)
+    e2e_commands: list[CommandSpec] = Field(default_factory=list)
     security_commands: list[CommandSpec] = Field(default_factory=list)
     hard_gates: list[str] = Field(default_factory=list)
     soft_gates: list[str] = Field(default_factory=list)

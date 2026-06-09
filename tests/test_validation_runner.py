@@ -6,7 +6,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from local_swe_controller.config import PatchPolicyConfig, PatchRejectByDefaultConfig
-from local_swe_controller.models import CommandResult, CommandSpec, FailureClass, RunStatus
+from local_swe_controller.models import (
+    CommandResult,
+    CommandSeverity,
+    CommandSpec,
+    FailureClass,
+    RunStatus,
+)
+from local_swe_controller.policy.compiler import PolicyCompiler
 from local_swe_controller.policy.schema import CompiledPolicy
 from local_swe_controller.validation.runner import ValidationRunner
 
@@ -507,27 +514,282 @@ def test_optional_scanner_unavailable_soft_gate_warns_and_skips(
     assert any("Optional scanner 'reuse' is unavailable" in warning for warning in report.warnings)
 
 
+def test_validation_runs_build_smoke_and_e2e_categories(
+    project_root: Path,
+    git_repo_factory,
+    init_git_repo,
+    tmp_path: Path,
+) -> None:
+    repo = git_repo_factory("workflow-categories")
+    (repo / "README.md").write_text("workflow\n", encoding="utf-8")
+    init_git_repo(repo)
+    policy_path = _write_policy(
+        tmp_path / "workflow-policy.json",
+        repo,
+        build_commands=[CommandSpec(command=["python", "-c", "print('build')"])],
+        smoke_commands=[CommandSpec(command=["python", "-c", "print('smoke')"])],
+        e2e_commands=[CommandSpec(command=["python", "-c", "print('e2e')"])],
+    )
+
+    runner = ValidationRunner(project_root / "configs" / "default_policy.yaml")
+    report = runner.validate(repo, policy_path=policy_path)
+
+    assert report.status == RunStatus.NO_ACTION_NEEDED
+    assert [command.category for command in report.commands] == ["build", "smoke", "e2e"]
+
+
+def test_validate_messy_script_fixture_reports_soft_readability_warnings(
+    project_root: Path,
+    temp_messy_script_repo: Path,
+) -> None:
+    before_status = subprocess.run(
+        ["git", "-C", str(temp_messy_script_repo), "status", "--short"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+    runner = ValidationRunner(project_root / "configs" / "default_policy.yaml")
+    report = runner.validate(temp_messy_script_repo)
+
+    after_status = subprocess.run(
+        ["git", "-C", str(temp_messy_script_repo), "status", "--short"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+    assert report.status == RunStatus.NO_ACTION_NEEDED
+    assert any(
+        warning.startswith("Script readability:") for warning in report.warnings
+    )
+    assert any(
+        command.spec.command == ["bash", "-n", "old_script.sh"] for command in report.commands
+    )
+    assert any(
+        command.spec.command[:3] == ["python", "-m", "py_compile"]
+        for command in report.commands
+    )
+    assert any(
+        "parse(file='test.R')" in " ".join(command.spec.command)
+        for command in report.commands
+    )
+    assert all(command.spec.command[:2] != ["bash", "old_script.sh"] for command in report.commands)
+    assert before_status == after_status
+
+
+def test_validate_script_workflow_fixture_uses_syntax_and_help_only(
+    project_root: Path,
+    temp_script_workflow_repo: Path,
+) -> None:
+    before_status = subprocess.run(
+        ["git", "-C", str(temp_script_workflow_repo), "status", "--short"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+    runner = ValidationRunner(project_root / "configs" / "default_policy.yaml")
+    report = runner.validate(temp_script_workflow_repo)
+
+    after_status = subprocess.run(
+        ["git", "-C", str(temp_script_workflow_repo), "status", "--short"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+    assert report.status == RunStatus.NO_ACTION_NEEDED
+    assert any(
+        warning.startswith("Workflow planning:") for warning in report.warnings
+    )
+    assert any(
+        command.spec.command[:3] == ["python", "-m", "py_compile"]
+        for command in report.commands
+    )
+    assert any(command.spec.command[-1] == "--help" for command in report.commands)
+    assert all(
+        not (
+            command.spec.command[0] == "python"
+            and command.spec.command[1].endswith("_Train.py")
+            and "--help" not in command.spec.command
+        )
+        for command in report.commands
+    )
+    assert all(
+        not (
+            command.spec.command[0] == "python"
+            and command.spec.command[1].endswith("_Test.py")
+            and "--help" not in command.spec.command
+        )
+        for command in report.commands
+    )
+    assert before_status == after_status
+
+
+def test_implicit_workflow_missing_dependency_help_is_soft_warning(
+    project_root: Path,
+    temp_script_workflow_repo: Path,
+) -> None:
+    before_status = subprocess.run(
+        ["git", "-C", str(temp_script_workflow_repo), "status", "--short"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    compiler = PolicyCompiler(project_root / "configs" / "default_policy.yaml")
+    policy = compiler.compile(temp_script_workflow_repo)
+    runner = ValidationRunner(project_root / "configs" / "default_policy.yaml")
+
+    scripted_results = [
+        _result(policy.build_commands[0], category="build"),
+        _result(
+            policy.smoke_commands[0],
+            exit_code=1,
+            stderr="ModuleNotFoundError: No module named 'h5py'",
+            category="smoke",
+        ),
+        *[_result(spec, category="smoke") for spec in policy.smoke_commands[1:]],
+    ]
+    runner.command_runner_factory = lambda **kwargs: FakeCommandRunner(  # type: ignore[assignment]
+        results=scripted_results
+    )
+
+    report = runner.validate(temp_script_workflow_repo, policy=policy)
+
+    after_status = subprocess.run(
+        ["git", "-C", str(temp_script_workflow_repo), "status", "--short"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert report.status == RunStatus.NO_ACTION_NEEDED
+    assert report.failure_class is None
+    assert any("dependency 'h5py' is missing" in warning for warning in report.warnings)
+    assert before_status == after_status
+
+
+def test_implicit_workflow_syntax_error_remains_hard_failure(
+    project_root: Path,
+    git_repo_factory,
+    init_git_repo,
+) -> None:
+    repo = git_repo_factory("script-workflow-syntax-error")
+    (repo / "DataPipe").mkdir(parents=True)
+    (repo / "DownStream").mkdir(parents=True)
+    (repo / "README.md").write_text("workflow\n", encoding="utf-8")
+    (repo / "DataPipe" / "Build_embedded_dataset.py").write_text(
+        "def broken(:\n    pass\n",
+        encoding="utf-8",
+    )
+    (repo / "DownStream" / "MTL_Train.py").write_text(
+        "import argparse\n"
+        "def main() -> None:\n"
+        "    parser = argparse.ArgumentParser()\n"
+        "    parser.parse_args()\n"
+        "if __name__ == '__main__':\n"
+        "    main()\n",
+        encoding="utf-8",
+    )
+    init_git_repo(repo)
+    before_status = subprocess.run(
+        ["git", "-C", str(repo), "status", "--short"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+    runner = ValidationRunner(project_root / "configs" / "default_policy.yaml")
+    report = runner.validate(repo)
+
+    after_status = subprocess.run(
+        ["git", "-C", str(repo), "status", "--short"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert report.status == RunStatus.BASELINE_FAILED
+    assert report.failure_class == FailureClass.BUILD
+    assert before_status == after_status
+
+
+def test_package_repo_environment_failure_remains_hard(
+    project_root: Path,
+    git_repo_factory,
+    init_git_repo,
+    tmp_path: Path,
+) -> None:
+    repo = git_repo_factory("package-smoke-environment")
+    (repo / "README.md").write_text("package\n", encoding="utf-8")
+    init_git_repo(repo)
+    policy_path = _write_policy(
+        tmp_path / "package-smoke-environment-policy.json",
+        repo,
+        repo_kind="package_repo",
+        smoke_commands=[
+            CommandSpec(
+                command=["python", "tool.py", "--help"],
+                severity=CommandSeverity.HARD,
+            )
+        ],
+    )
+    runner = ValidationRunner(project_root / "configs" / "default_policy.yaml")
+    runner.command_runner_factory = lambda **kwargs: FakeCommandRunner(  # type: ignore[assignment]
+        results=[
+            _result(
+                CommandSpec(command=["python", "tool.py", "--help"]),
+                exit_code=1,
+                stderr="ModuleNotFoundError: No module named 'h5py'",
+                category="smoke",
+            )
+        ]
+    )
+
+    report = runner.validate(repo, policy_path=policy_path)
+
+    assert report.status == RunStatus.STOPPED_BY_ENVIRONMENT
+    assert report.failure_class == FailureClass.ENVIRONMENT
+
+
 def _write_policy(
     path: Path,
     repo_root: Path,
     *,
+    repo_kind: str = "unknown",
     format_commands: list[CommandSpec] | None = None,
     lint_commands: list[CommandSpec] | None = None,
     typecheck_commands: list[CommandSpec] | None = None,
+    build_commands: list[CommandSpec] | None = None,
     test_commands: list[CommandSpec] | None = None,
+    smoke_commands: list[CommandSpec] | None = None,
+    e2e_commands: list[CommandSpec] | None = None,
     security_commands: list[CommandSpec] | None = None,
 ) -> Path:
     policy = CompiledPolicy(
         repo_root=repo_root.resolve(),
+        repo_kind=repo_kind,
         policy_version="0.1",
         source_files=[],
         setup_commands=[],
         format_commands=format_commands or [],
         lint_commands=lint_commands or [],
         typecheck_commands=typecheck_commands or [],
+        build_commands=build_commands or [],
         test_commands=test_commands or [],
+        smoke_commands=smoke_commands or [],
+        e2e_commands=e2e_commands or [],
         security_commands=security_commands or [],
-        hard_gates=["format", "lint", "typecheck", "test", "security", "policy"],
+        hard_gates=[
+            "format",
+            "lint",
+            "typecheck",
+            "build",
+            "test",
+            "smoke",
+            "e2e",
+            "security",
+            "policy",
+        ],
         soft_gates=[],
         forbidden_commands=[
             "rm -rf",
@@ -559,9 +821,12 @@ def _write_soft_security_policy(
         format_commands=[],
         lint_commands=[],
         typecheck_commands=[],
+        build_commands=[],
         test_commands=[],
+        smoke_commands=[],
+        e2e_commands=[],
         security_commands=security_commands,
-        hard_gates=["format", "lint", "typecheck", "test", "policy"],
+        hard_gates=["format", "lint", "typecheck", "build", "test", "smoke", "e2e", "policy"],
         soft_gates=["security"],
         forbidden_commands=[],
         forbidden_paths=[],

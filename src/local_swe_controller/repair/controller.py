@@ -286,7 +286,9 @@ class RepairController:
             "patch_generation",
             profile_name=model_profile_name,
         ).profile_name
-        if baseline_report.status == RunStatus.NO_ACTION_NEEDED:
+        if baseline_report.status == RunStatus.NO_ACTION_NEEDED and not (
+            self._has_actionable_repo_readability_warnings(policy, baseline_report)
+        ):
             result = RepairResult(
                 run_id=run.run_id,
                 repo_root=repo_root,
@@ -385,6 +387,7 @@ class RepairController:
                 report=last_failure_report,
                 iteration=iteration,
                 profile=patch_route.profile,
+                policy=policy,
             )
             route = self.router.resolve(
                 "patch_generation",
@@ -698,16 +701,19 @@ class RepairController:
         report: ValidationReport,
         iteration: int,
         profile: ModelProfile,
+        policy: CompiledPolicy,
     ) -> str:
         retry_guidance = self._retry_guidance(report.failure_class, iteration)
         header = (
             f"Goal: {goal}\n"
             f"Repository: {repo_root}\n"
+            f"Repository kind: {policy.repo_kind}\n"
             f"Repair iteration: {iteration}\n"
             f"Validation status: {report.status.value}\n"
             f"Failure class: {report.failure_class.value if report.failure_class else 'NONE'}\n"
             "Return exactly one unified diff patch that fixes the failure without changing tests, "
             "dependencies, CI, policies, generated artifacts, or unrelated files.\n"
+            f"{self._repo_kind_guidance(policy)}\n"
             f"{retry_guidance}\n"
         )
         return self._build_bounded_prompt(
@@ -725,10 +731,12 @@ class RepairController:
         goal: str,
         report: ValidationReport,
         profile: ModelProfile,
+        policy: CompiledPolicy,
     ) -> str:
         header = (
             f"Goal: {goal}\n"
             f"Repository: {repo_root}\n"
+            f"Repository kind: {policy.repo_kind}\n"
             f"Validation status: {report.status.value}\n"
             f"Failure class: {report.failure_class.value if report.failure_class else 'NONE'}\n"
             "Return exactly one unified diff patch containing only regression tests. "
@@ -742,6 +750,35 @@ class RepairController:
             header=header,
             mode="test_generation",
         )
+
+    def _repo_kind_guidance(self, policy: CompiledPolicy) -> str:
+        if policy.repo_kind == "script_collection":
+            return (
+                "Prioritize readability, file and folder naming clarity, README usage guidance, "
+                "CLI help behavior, and behavior-preserving cleanup. "
+                "Small safe renames are allowed only when they improve script organization."
+            )
+        if policy.repo_kind == "workflow_repo":
+            workflow_sources = self.policy_compiler.repo_profiler.profile(
+                policy.repo_root
+            ).workflow_sources
+            if "implicit_script_chain" in workflow_sources:
+                return (
+                    "Preserve the script workflow behavior. First candidate should prefer "
+                    "README or documentation-only workflow fixes. Python code changes are "
+                    "allowed only when narrowly targeted to top-level executable scripts and "
+                    "behavior-preserving. Do not add argparse to library, helper, or model "
+                    "modules. Do not add parser.add_argument('--help', ...) or "
+                    "parser.add_argument(\"--help\", ...). Do not add parse_args() at module "
+                    "import time. Focus on README workflow documentation, safe CLI help paths, "
+                    "example commands, and small dry-run or smoke affordances only when clearly "
+                    "safe. Do not invent a package framework or run training by default."
+                )
+            return (
+                "Preserve the workflow shape. Focus on the smallest safe end-to-end smoke path "
+                "and avoid broad refactors or dependency changes."
+            )
+        return "Prefer the smallest safe patch that directly addresses the failing validator."
 
     def _retry_guidance(self, failure_class: FailureClass | None, iteration: int) -> str:
         if iteration <= 1 or failure_class is None:
@@ -802,6 +839,7 @@ class RepairController:
             goal=goal,
             report=baseline_report,
             profile=route.profile,
+            policy=policy,
         )
         route = self.router.resolve(
             "test_generation",
@@ -1028,7 +1066,31 @@ class RepairController:
                 sections.append(f"stderr tail:\n```text\n{stderr_tail}\n```")
         if report.summary:
             sections.append(f"Summary: {report.summary}")
+        if report.warnings:
+            sections.append("Warnings:")
+            sections.extend(f"- {warning}" for warning in report.warnings)
         return "\n".join(sections)
+
+    def _has_actionable_repo_readability_warnings(
+        self,
+        policy: CompiledPolicy,
+        report: ValidationReport,
+    ) -> bool:
+        script_warning = any(
+            warning.startswith("Script readability:") for warning in report.warnings
+        )
+        workflow_warning = any(
+            warning.startswith("Workflow planning:") for warning in report.warnings
+        )
+        if policy.repo_kind == "script_collection":
+            return script_warning
+        if policy.repo_kind == "workflow_repo":
+            workflow_sources = self.policy_compiler.repo_profiler.profile(
+                policy.repo_root
+            ).workflow_sources
+            if "implicit_script_chain" in workflow_sources:
+                return script_warning or workflow_warning
+        return False
 
     def _repo_summary(self, repo_root: Path) -> str:
         included_files: list[str] = []
@@ -1483,9 +1545,12 @@ class RepairController:
             for pre_patch_path in pre_patch_paths or []:
                 self._apply_patch(managed.path, pre_patch_path)
             self._apply_patch(managed.path, patch_path)
+            patched_policy = self.policy_compiler.compile(managed.path).model_copy(
+                update={"repo_root": repo_root.resolve()}
+            )
             report = self.validation_runner.validate_worktree(
                 repo_root=repo_root,
-                policy=policy,
+                policy=patched_policy,
                 worktree_path=managed.path,
                 selected_python=selected_python,
                 artifact_dir=artifact_dir,

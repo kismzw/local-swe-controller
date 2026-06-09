@@ -18,6 +18,21 @@ def fixture_repo_path() -> Path:
     return PROJECT_ROOT / "examples" / "fixture_python_repo"
 
 
+@pytest.fixture()
+def messy_script_fixture_repo_path() -> Path:
+    return PROJECT_ROOT / "examples" / "fixture_messy_script_collection_repo"
+
+
+@pytest.fixture()
+def script_workflow_fixture_repo_path() -> Path:
+    return PROJECT_ROOT / "examples" / "fixture_script_workflow_repo"
+
+
+@pytest.fixture()
+def script_workflow_priority_fixture_repo_path() -> Path:
+    return PROJECT_ROOT / "examples" / "fixture_script_workflow_priority_repo"
+
+
 @pytest.fixture(autouse=True)
 def artifact_root_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     root = tmp_path / "artifacts"
@@ -30,6 +45,63 @@ def temp_fixture_repo(tmp_path: Path, fixture_repo_path: Path) -> Path:
     destination = tmp_path / "fixture_python_repo"
     shutil.copytree(
         fixture_repo_path,
+        destination,
+        ignore=shutil.ignore_patterns(
+            ".git",
+            ".local-swe",
+            ".pytest_cache",
+            ".ruff_cache",
+            "__pycache__",
+        ),
+    )
+    _init_git_repo(destination)
+    return destination
+
+
+@pytest.fixture()
+def temp_messy_script_repo(tmp_path: Path, messy_script_fixture_repo_path: Path) -> Path:
+    destination = tmp_path / "fixture_messy_script_collection_repo"
+    shutil.copytree(
+        messy_script_fixture_repo_path,
+        destination,
+        ignore=shutil.ignore_patterns(
+            ".git",
+            ".local-swe",
+            ".pytest_cache",
+            ".ruff_cache",
+            "__pycache__",
+        ),
+    )
+    _init_git_repo(destination)
+    return destination
+
+
+@pytest.fixture()
+def temp_script_workflow_repo(tmp_path: Path, script_workflow_fixture_repo_path: Path) -> Path:
+    destination = tmp_path / "fixture_script_workflow_repo"
+    shutil.copytree(
+        script_workflow_fixture_repo_path,
+        destination,
+        ignore=shutil.ignore_patterns(
+            ".git",
+            ".local-swe",
+            ".pytest_cache",
+            ".ruff_cache",
+            "__pycache__",
+        ),
+    )
+    _init_git_repo(destination)
+    return destination
+
+
+@pytest.fixture()
+def temp_script_workflow_priority_repo(
+    tmp_path: Path,
+    script_workflow_priority_fixture_repo_path: Path,
+) -> Path:
+    destination = tmp_path / "fixture_script_workflow_priority_repo"
+    shutil.copytree(
+        script_workflow_priority_fixture_repo_path,
         destination,
         ignore=shutil.ignore_patterns(
             ".git",

@@ -42,6 +42,11 @@ class MissingToolBehavior(str, Enum):
     SKIP = "SKIP"
 
 
+class CommandSeverity(str, Enum):
+    HARD = "hard"
+    SOFT = "soft"
+
+
 class CommandSpec(BaseModel):
     """Explicit command specification using argv form."""
 
@@ -55,6 +60,7 @@ class CommandSpec(BaseModel):
     optional: bool = False
     tool_name: str | None = None
     missing_tool_behavior: MissingToolBehavior = MissingToolBehavior.FAIL
+    severity: CommandSeverity = CommandSeverity.HARD
 
     @field_validator("command")
     @classmethod

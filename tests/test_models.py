@@ -5,6 +5,7 @@ from pathlib import Path
 
 from local_swe_controller.models import (
     CommandResult,
+    CommandSeverity,
     CommandSpec,
     FailureClass,
     RunStatus,
@@ -35,3 +36,4 @@ def test_validation_report_model() -> None:
 
     assert report.commands[0].exit_code == 0
     assert report.status is RunStatus.SUCCESS
+    assert report.commands[0].spec.severity == CommandSeverity.HARD

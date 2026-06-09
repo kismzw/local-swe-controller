@@ -13,6 +13,7 @@ from local_swe_controller.config import DefaultPolicyConfig, load_config
 from local_swe_controller.exceptions import CommandSafetyError, ValidationError
 from local_swe_controller.models import (
     CommandResult,
+    CommandSeverity,
     CommandSpec,
     FailureClass,
     MissingToolBehavior,
@@ -20,6 +21,7 @@ from local_swe_controller.models import (
     ValidationReport,
 )
 from local_swe_controller.policy.compiler import PolicyCompiler
+from local_swe_controller.policy.profiler import RepoProfiler
 from local_swe_controller.policy.schema import CompiledPolicy
 from local_swe_controller.sandbox.commands import CommandRunner, PythonExecutionConfig
 from local_swe_controller.sandbox.worktree import ManagedWorktree, WorktreeManager
@@ -35,6 +37,7 @@ class ValidationRunner:
         self.default_policy_path = default_policy_path
         self.default_policy = load_config(default_policy_path, DefaultPolicyConfig)
         self.policy_compiler = PolicyCompiler(default_policy_path)
+        self.repo_profiler = RepoProfiler()
         self.classifier = FailureClassifier(self.default_policy.failure_classification)
         base_root = default_artifact_root()
         self.default_artifact_root = base_root / "logs"
@@ -252,6 +255,7 @@ class ValidationRunner:
             ),
         )
         warnings = [warning] if warning else []
+        warnings.extend(self._profile_warnings(worktree_path, policy))
         if (
             policy.setup_commands
             and not self.default_policy.command_policy.allow_network_by_default
@@ -367,6 +371,10 @@ class ValidationRunner:
         self._trace_validation_finished(trace_callback, phase, report)
         return report
 
+    def _profile_warnings(self, repo_root: Path, policy: CompiledPolicy) -> list[str]:
+        profile = self.repo_profiler.profile(repo_root)
+        return [*profile.readability_warnings, *profile.planning_warnings]
+
     def _iter_policy_commands(
         self,
         policy: CompiledPolicy,
@@ -375,7 +383,10 @@ class ValidationRunner:
             ("format", policy.format_commands),
             ("lint", policy.lint_commands),
             ("typecheck", policy.typecheck_commands),
+            ("build", policy.build_commands),
             ("test", policy.test_commands),
+            ("smoke", policy.smoke_commands),
+            ("e2e", policy.e2e_commands),
             ("security", policy.security_commands),
         ]
 
@@ -452,6 +463,10 @@ class ValidationRunner:
             return {"action": "continue"}
 
         failure_class = self.classifier.classify(result)
+        if category == "build" and failure_class == FailureClass.UNKNOWN:
+            failure_class = FailureClass.BUILD
+        if category in {"smoke", "e2e"} and failure_class == FailureClass.UNKNOWN:
+            failure_class = FailureClass.TEST
         summary = self._build_summary(
             category,
             result,
@@ -459,9 +474,55 @@ class ValidationRunner:
             worktree_path,
             selected_python,
         )
+        soft_environment_warning = self._soft_environment_warning(
+            category=category,
+            spec=spec,
+            result=result,
+            failure_class=failure_class,
+            policy=policy,
+            worktree_path=worktree_path,
+            selected_python=selected_python,
+        )
+        if soft_environment_warning is not None:
+            return {"action": "warn", "summary": soft_environment_warning}
         if gate_mode == "soft":
             return {"action": "warn", "summary": summary}
         return {"action": "fail", "summary": summary, "failure_class": failure_class}
+
+    def _soft_environment_warning(
+        self,
+        *,
+        category: str,
+        spec: CommandSpec,
+        result: CommandResult,
+        failure_class: FailureClass,
+        policy: CompiledPolicy,
+        worktree_path: Path,
+        selected_python: Path | None,
+    ) -> str | None:
+        if spec.severity != CommandSeverity.SOFT:
+            return None
+        if category != "smoke" or policy.repo_kind != "workflow_repo":
+            return None
+        profile = self.repo_profiler.profile(worktree_path)
+        if "implicit_script_chain" not in profile.workflow_sources:
+            return None
+        if failure_class != FailureClass.ENVIRONMENT:
+            return None
+        missing_modules = sorted(self._missing_modules(f"{result.stdout}\n{result.stderr}"))
+        if not missing_modules:
+            return None
+        dependency = missing_modules[0]
+        interpreter_hint = (
+            f"the selected interpreter ({selected_python})"
+            if selected_python is not None
+            else "a dependency-aware project interpreter"
+        )
+        return (
+            "Soft smoke check could not run because dependency "
+            f"'{dependency}' is missing. Syntax checks passed; provide --python or --venv "
+            f"for dependency-aware smoke validation using {interpreter_hint}."
+        )
 
     def _environment_diagnosis(
         self,

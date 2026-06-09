@@ -268,6 +268,11 @@ class LangGraphRepairAdapter:
             or state.baseline_report
         )
         baseline_report = self._require_report(report, "failure context")
+        policy = self.controller.validation_runner._load_policy(  # noqa: SLF001
+            state.repo_path,
+            Path(state.policy_path) if state.policy_path else None,
+            None,
+        )
         route = self.controller.router.resolve(
             "patch_generation",
             profile_name=state.resolved_model_profile,
@@ -278,6 +283,7 @@ class LangGraphRepairAdapter:
             report=baseline_report,
             iteration=state.iteration,
             profile=route.profile,
+            policy=policy,
         )
         route = self.controller.router.resolve(
             "patch_generation",

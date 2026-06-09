@@ -2,14 +2,57 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
 from local_swe_controller.policy.schema import CompiledPolicy
 
+_PROTECTED_ARTIFACT_DIRS = {"data", "outputs", "artifacts", "checkpoints", "logs"}
+_PROTECTED_ARTIFACT_SUFFIXES = {
+    ".csv",
+    ".tsv",
+    ".jsonl",
+    ".parquet",
+    ".zarr",
+    ".feather",
+    ".arrow",
+    ".sqlite",
+    ".sqlite3",
+    ".db",
+    ".npy",
+    ".npz",
+    ".h5",
+    ".hdf5",
+    ".pt",
+    ".pth",
+    ".ckpt",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".tif",
+    ".svs",
+    ".pdf",
+    ".zip",
+    ".tar",
+    ".gz",
+}
+_ARGPARSE_HELP_PATTERN = re.compile(r"""add_argument\(\s*['"]--help['"]""")
+_PARSE_ARGS_PATTERN = re.compile(r"\bparse_args\s*\(")
+_ARGPARSE_SIGNAL_PATTERN = re.compile(r"\b(argparse|ArgumentParser|add_argument|parse_args)\b")
+
 
 class PatchParseError(ValueError):
     """Raised when a candidate patch is malformed or unsafe."""
+
+
+@dataclass(slots=True)
+class PatchHunk:
+    """Parsed hunk body for one file change."""
+
+    header: str
+    lines: list[str]
 
 
 @dataclass(slots=True)
@@ -21,6 +64,7 @@ class PatchFileChange:
     added_lines: list[str]
     removed_lines: list[str]
     hunk_count: int
+    hunks: list[PatchHunk]
     is_new_file: bool = False
     is_deleted_file: bool = False
 
@@ -75,6 +119,7 @@ class PatchParser:
                     added_lines=[],
                     removed_lines=[],
                     hunk_count=0,
+                    hunks=[],
                     is_deleted_file=line[4:].strip() != "/dev/null",
                 )
                 state = "expect_new"
@@ -92,20 +137,25 @@ class PatchParser:
                 if current is None or state != "body":
                     raise PatchParseError("Malformed patch: hunk without file header.")
                 current.hunk_count += 1
+                current.hunks.append(PatchHunk(header=line, lines=[]))
                 continue
             if line.startswith("+") and not line.startswith("+++"):
                 if current is None or current.hunk_count == 0:
                     raise PatchParseError("Malformed patch: added line outside hunk.")
                 current.added_lines.append(line[1:])
+                current.hunks[-1].lines.append(line)
                 diff_line_count += 1
                 continue
             if line.startswith("-") and not line.startswith("---"):
                 if current is None or current.hunk_count == 0:
                     raise PatchParseError("Malformed patch: removed line outside hunk.")
                 current.removed_lines.append(line[1:])
+                current.hunks[-1].lines.append(line)
                 diff_line_count += 1
                 continue
             if line.startswith((" ", "\\ No newline at end of file", "diff --git", "index ")):
+                if current is not None and current.hunk_count > 0 and line.startswith((" ", "\\")):
+                    current.hunks[-1].lines.append(line)
                 continue
             if current is None:
                 raise PatchParseError("Malformed patch: unexpected content before file header.")
@@ -134,6 +184,9 @@ class PatchParser:
             reasons.append(
                 f"Patch exceeds max diff lines ({parsed_patch.diff_line_count} > {max_diff_lines})."
             )
+        rename_count = sum(1 for file_change in parsed_patch.files if self._is_rename(file_change))
+        if rename_count:
+            reasons.extend(self._rename_reasons(parsed_patch, policy, rename_count))
 
         for file_change in parsed_patch.files:
             changed_path = file_change.changed_path
@@ -165,6 +218,8 @@ class PatchParser:
                 reasons.append(
                     f"Patch adds secret-looking content and is rejected: {changed_path}"
                 )
+        reasons.extend(self._implicit_script_chain_reasons(parsed_patch, policy))
+        reasons.extend(self._readme_consistency_reasons(parsed_patch, policy))
 
         return PatchCheckResult(accepted=not reasons, reasons=reasons)
 
@@ -180,6 +235,141 @@ class PatchParser:
             changed_path == item.rstrip("/") or changed_path.startswith(item.rstrip("/") + "/")
             for item in forbidden_paths
         )
+
+    def _rename_reasons(
+        self,
+        parsed_patch: ParsedPatch,
+        policy: CompiledPolicy,
+        rename_count: int,
+    ) -> list[str]:
+        if policy.repo_kind != "script_collection":
+            return ["Patch renames files or folders and requires approval."]
+        if not policy.patch_policy.allow_script_collection_renames:
+            return ["Patch renames files or folders and requires approval."]
+        if rename_count > policy.patch_policy.max_script_collection_renames:
+            return [
+                "Patch renames too many files for a script_collection repo "
+                f"({rename_count} > {policy.patch_policy.max_script_collection_renames})."
+            ]
+        reasons: list[str] = []
+        for file_change in parsed_patch.files:
+            if not self._is_rename(file_change):
+                continue
+            old_path = file_change.old_path.removeprefix("a/")
+            new_path = file_change.new_path.removeprefix("b/")
+            if self._is_license_file(old_path, policy) or self._is_license_file(new_path, policy):
+                reasons.append(
+                    f"Patch renames license-related files and requires approval: {new_path}"
+                )
+            if self._is_ci_file(old_path, policy) or self._is_ci_file(new_path, policy):
+                reasons.append(f"Patch renames CI configuration and requires approval: {new_path}")
+            if self._is_lockfile(old_path, policy) or self._is_lockfile(new_path, policy):
+                reasons.append(f"Patch renames lockfiles and requires approval: {new_path}")
+            if self._is_security_sensitive_path(
+                old_path, policy
+            ) or self._is_security_sensitive_path(new_path, policy):
+                reasons.append(
+                    f"Patch renames a security-sensitive path and requires approval: {new_path}"
+                )
+            if self._is_protected_artifact_path(
+                old_path
+            ) or self._is_protected_artifact_path(new_path):
+                reasons.append(
+                    f"Patch renames protected data artifacts and requires approval: {new_path}"
+                )
+        return reasons
+
+    def _readme_consistency_reasons(
+        self,
+        parsed_patch: ParsedPatch,
+        policy: CompiledPolicy,
+    ) -> list[str]:
+        if policy.repo_kind != "script_collection":
+            return []
+        readme_path = self._first_readme(policy.repo_root)
+        if readme_path is None:
+            return []
+        try:
+            readme_text = readme_path.read_text(encoding="utf-8")
+        except OSError:
+            return []
+        readme_changed = any(
+            Path(item.changed_path).name.upper().startswith("README")
+            for item in parsed_patch.files
+        )
+        reasons: list[str] = []
+        for file_change in parsed_patch.files:
+            if not self._is_rename(file_change):
+                continue
+            old_rel = file_change.old_path.removeprefix("a/")
+            old_name = Path(old_rel).name
+            if old_rel in readme_text or old_name in readme_text:
+                if not readme_changed:
+                    reasons.append(
+                        f"Patch renames {old_rel} but does not update README references."
+                    )
+        return reasons
+
+    def _implicit_script_chain_reasons(
+        self,
+        parsed_patch: ParsedPatch,
+        policy: CompiledPolicy,
+    ) -> list[str]:
+        if policy.repo_kind != "workflow_repo":
+            return []
+        if "implicit_script_chain" not in policy.workflow_sources:
+            return []
+
+        reasons: list[str] = []
+        argparse_files: set[str] = set()
+        for file_change in parsed_patch.files:
+            changed_path = file_change.changed_path
+            if not changed_path.endswith(".py"):
+                continue
+            if any(_ARGPARSE_SIGNAL_PATTERN.search(line) for line in file_change.added_lines):
+                argparse_files.add(changed_path)
+            if any(_ARGPARSE_HELP_PATTERN.search(line) for line in file_change.added_lines):
+                reasons.append(
+                    "Patch adds explicit argparse --help boilerplate and is rejected: "
+                    f"{changed_path}"
+                )
+            if self._is_cli_protected_module(changed_path) and any(
+                _ARGPARSE_SIGNAL_PATTERN.search(line) for line in file_change.added_lines
+            ):
+                reasons.append(
+                    "Patch injects CLI parsing into importable workflow module and is "
+                    f"rejected: {changed_path}"
+                )
+            reasons.extend(self._top_level_parse_args_reasons(file_change))
+        if len(argparse_files) > 3:
+            reasons.append(
+                "Patch sprays argparse boilerplate across too many Python files for an "
+                f"implicit script workflow ({len(argparse_files)} > 3)."
+            )
+        return reasons
+
+    def _top_level_parse_args_reasons(self, file_change: PatchFileChange) -> list[str]:
+        reasons: list[str] = []
+        for hunk in file_change.hunks:
+            if not any(
+                line.startswith("+") and _PARSE_ARGS_PATTERN.search(line[1:]) for line in hunk.lines
+            ):
+                continue
+            hunk_text = "\n".join(hunk.lines)
+            if 'if __name__ == "__main__"' in hunk_text or "if __name__ == '__main__'" in hunk_text:
+                continue
+            if re.search(r"^\+\s*def\s+main\s*\(", hunk_text, flags=re.MULTILINE):
+                continue
+            reasons.append(
+                "Patch adds parse_args() outside an obvious main guard and is rejected: "
+                f"{file_change.changed_path}"
+            )
+        return reasons
+
+    def _is_rename(self, file_change: PatchFileChange) -> bool:
+        if file_change.is_new_file or file_change.is_deleted_file:
+            return False
+        return file_change.old_path.removeprefix("a/") != file_change.new_path.removeprefix("b/")
 
     def _is_dependency_file(self, changed_path: str, policy: CompiledPolicy) -> bool:
         name = Path(changed_path).name
@@ -202,6 +392,14 @@ class PatchParser:
         path = Path(changed_path)
         return "tests" in path.parts or path.name.startswith("test_")
 
+    def _is_cli_protected_module(self, changed_path: str) -> bool:
+        path = Path(changed_path)
+        if changed_path.startswith("ModelBase/"):
+            return True
+        if "models" in path.parts:
+            return True
+        return path.name in {"utils.py", "dataset_framework.py", "h5tools.py"}
+
     def _is_security_sensitive_path(self, changed_path: str, policy: CompiledPolicy) -> bool:
         return self._matches_configured_path(
             changed_path,
@@ -213,6 +411,19 @@ class PatchParser:
             changed_path == item.rstrip("/") or changed_path.startswith(item.rstrip("/") + "/")
             for item in configured_paths
         )
+
+    def _is_protected_artifact_path(self, changed_path: str) -> bool:
+        path = Path(changed_path)
+        return any(part in _PROTECTED_ARTIFACT_DIRS for part in path.parts) or (
+            path.suffix.casefold() in _PROTECTED_ARTIFACT_SUFFIXES
+        )
+
+    def _first_readme(self, repo_root: Path) -> Path | None:
+        for name in ("README.md", "README.rst", "README.txt"):
+            path = repo_root / name
+            if path.is_file():
+                return path
+        return None
 
     def _dependency_change_reasons(self, file_change: PatchFileChange) -> list[str]:
         changed_path = file_change.changed_path

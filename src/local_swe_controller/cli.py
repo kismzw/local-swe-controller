@@ -19,6 +19,7 @@ from local_swe_controller.exceptions import (
     PRWorkflowError,
     ValidationError,
 )
+from local_swe_controller.inspect import RepoInspector
 from local_swe_controller.models import RunStatus
 from local_swe_controller.orchestration.langgraph_adapter import LangGraphRepairAdapter
 from local_swe_controller.policy.compiler import PolicyCompiler
@@ -96,6 +97,38 @@ def compile_policy(
     typer.echo(f"Compiled policy written to {written_path}")
     if json_output:
         typer.echo(policy.model_dump_json(indent=2))
+
+
+@app.command("inspect")
+def inspect(
+    repo: Annotated[
+        Path,
+        typer.Option(
+            ...,
+            exists=False,
+            file_okay=False,
+            dir_okay=True,
+            help="Target repository path.",
+        ),
+    ],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the inspection report as JSON."),
+    ] = False,
+) -> None:
+    """Inspect repository profiling and inferred validation plan without executing commands."""
+
+    inspector = RepoInspector(default_policy_path=_default_policy_path())
+
+    try:
+        report = inspector.inspect(repo)
+    except (ConfigError, PolicyCompileError, LocalSweError) as exc:
+        raise typer.Exit(code=_print_error(str(exc))) from None
+
+    if json_output:
+        typer.echo(report.model_dump_json(indent=2))
+        return
+    typer.echo(inspector.render_text(report))
 
 
 @app.command("validate")

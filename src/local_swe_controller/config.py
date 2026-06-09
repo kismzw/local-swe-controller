@@ -111,6 +111,8 @@ class PatchPolicyConfig(BaseModel):
     test_paths: list[str] = Field(default_factory=list)
     security_sensitive_paths: list[str] = Field(default_factory=list)
     secret_patterns: list[str] = Field(default_factory=list)
+    allow_script_collection_renames: bool = True
+    max_script_collection_renames: int = Field(default=3, ge=0)
     reject_by_default: PatchRejectByDefaultConfig = Field(
         default_factory=PatchRejectByDefaultConfig
     )
