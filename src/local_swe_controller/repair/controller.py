@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import difflib
 import re
 import subprocess
 from dataclasses import dataclass
@@ -30,7 +31,13 @@ from local_swe_controller.models import (
 )
 from local_swe_controller.policy.compiler import PolicyCompiler
 from local_swe_controller.policy.schema import CompiledPolicy
-from local_swe_controller.repair.patch_parser import ParsedPatch, PatchParseError, PatchParser
+from local_swe_controller.repair.patch_parser import (
+    ParsedPatch,
+    PatchParseError,
+    PatchParser,
+    extract_patch_block,
+    normalize_patch_block,
+)
 from local_swe_controller.sandbox.commands import CommandRunner, PythonExecutionConfig
 from local_swe_controller.sandbox.worktree import WorktreeManager
 from local_swe_controller.storage import ArtifactStore, RunContext
@@ -42,6 +49,9 @@ _PROMPT_MAX_COMMAND_TAIL_CHARS = 2_000
 _PROMPT_MAX_FILE_CHARS = 8_000
 _PROMPT_MAX_FILES = 12
 _PROMPT_MAX_SUMMARY_FILES = 40
+_PROMPT_MAX_RETRY_PATCH_CHARS = 8_000
+_PROMPT_MAX_RETRY_TARGET_FILE_CHARS = 4_000
+_PROMPT_MAX_RETRY_FEEDBACK_CHARS = 12_000
 _EXCLUDED_DIR_NAMES = {
     ".git",
     ".hg",
@@ -144,6 +154,19 @@ _TRACEBACK_FILE_PATTERN = re.compile(
     r'File "([^"]+)"|'
     r'([\w./-]+\.(?:py|pyi|js|jsx|ts|tsx|toml|ya?ml|json|md|rs|go|java|kt|c|cc|cpp|h|hpp))'
 )
+_PASSING_VALIDATION_STATUSES = {RunStatus.NO_ACTION_NEEDED, RunStatus.VALID_WITH_WARNINGS}
+_PATCH_GENERATION_SYSTEM_PROMPT = (
+    "You are a deterministic patch proposer. Return only one complete unified diff patch. "
+    "Do not include markdown fences, XML tags, or explanatory prose."
+)
+_PATCH_REPAIR_SYSTEM_PROMPT = (
+    "You are repairing a previously rejected patch. Return only one complete valid unified "
+    "diff patch with correct hunk headers and real context lines. Do not include markdown "
+    "fences, XML tags, or explanatory prose."
+)
+_TEST_GENERATION_SYSTEM_PROMPT = (
+    "You generate deterministic regression test patches only. Return only a unified diff patch."
+)
 
 
 class RepairResult(BaseModel):
@@ -185,6 +208,15 @@ class FailureSignature:
     changed_files: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class RejectedPatchSignature:
+    """Stable signature for repeated pre-apply patch rejection."""
+
+    stop_reason: str
+    patch_hash: str
+    rejection_hash: str
+
+
 @dataclass(slots=True)
 class GeneratedTestStage:
     accepted: bool
@@ -221,6 +253,7 @@ class RepairController:
         max_diff_lines: int | None = None,
         timeout_per_command: int | None = None,
         max_total_runtime_seconds: int | None = None,
+        until_success: bool = False,
         keep_worktree: bool = False,
         selected_python: Path | None = None,
     ) -> RepairResult:
@@ -247,11 +280,11 @@ class RepairController:
                 "goal": goal,
                 "command_type": "repair",
                 "generate_tests": generate_tests,
-                "max_iters": max_iters,
+                "max_iters": None if until_success else max_iters,
                 "max_candidates": max_candidates,
                 "max_diff_lines": max_diff_lines,
                 "timeout_per_command": timeout_per_command,
-                "max_total_runtime_seconds": max_total_runtime_seconds,
+                "max_total_runtime_seconds": None if until_success else max_total_runtime_seconds,
             },
         )
 
@@ -286,15 +319,19 @@ class RepairController:
             "patch_generation",
             profile_name=model_profile_name,
         ).profile_name
-        if baseline_report.status == RunStatus.NO_ACTION_NEEDED and not (
+        if baseline_report.status in _PASSING_VALIDATION_STATUSES and not (
             self._has_actionable_repo_readability_warnings(policy, baseline_report)
         ):
             result = RepairResult(
                 run_id=run.run_id,
                 repo_root=repo_root,
                 goal=goal,
-                status=RunStatus.NO_ACTION_NEEDED,
-                summary="Baseline validation already passes; no repair was attempted.",
+                status=baseline_report.status,
+                summary=(
+                    "Baseline validation already passes with warnings; no repair was attempted."
+                    if baseline_report.status == RunStatus.VALID_WITH_WARNINGS
+                    else "Baseline validation already passes; no repair was attempted."
+                ),
                 model_profile=resolved_profile_name,
                 artifact_dir=run.artifact_dir,
                 policy_path=policy_path,
@@ -360,27 +397,55 @@ class RepairController:
         )
         if formatter_result is not None:
             return self._finalize(run, formatter_result)
+        workflow_readme_result = self._attempt_workflow_readme_repair(
+            run=run,
+            repo_root=repo_root,
+            goal=goal,
+            policy=policy,
+            policy_path=policy_path,
+            baseline_report=baseline_report,
+            model_profile=patch_route.profile_name,
+            keep_worktree=keep_worktree,
+            timeout_per_command=timeout_per_command,
+            max_diff_lines=max_diff_lines,
+            selected_python=selected_python,
+            generated_test_stage=generated_test_stage,
+        )
+        if workflow_readme_result is not None:
+            return self._finalize(run, workflow_readme_result)
         seen_failures: set[FailureSignature] = set()
+        seen_rejected_patches: dict[RejectedPatchSignature, int] = {}
         last_failure_report = generated_test_stage.validation_report or baseline_report
         last_result: RepairResult | None = None
+        repeated_rejected_patch_count = 0
         candidates_attempted = 0
 
-        for iteration in range(1, max_iters + 1):
-            runtime_stop = self._runtime_budget_stop(
-                run=run,
-                repo_root=repo_root,
-                goal=goal,
-                policy_path=policy_path,
-                baseline_report=baseline_report,
-                model_profile=resolved_profile_name,
-                iterations_attempted=iteration - 1,
-                candidates_attempted=candidates_attempted,
-                started=started,
-                max_total_runtime_seconds=max_total_runtime_seconds,
-            )
-            if runtime_stop is not None:
-                return self._finalize(run, runtime_stop)
+        iteration = 1
+        while True:
+            if not until_success and iteration > max_iters:
+                break
+            if not until_success:
+                runtime_stop = self._runtime_budget_stop(
+                    run=run,
+                    repo_root=repo_root,
+                    goal=goal,
+                    policy_path=policy_path,
+                    baseline_report=baseline_report,
+                    model_profile=resolved_profile_name,
+                    iterations_attempted=iteration - 1,
+                    candidates_attempted=candidates_attempted,
+                    started=started,
+                    max_total_runtime_seconds=max_total_runtime_seconds,
+                )
+                if runtime_stop is not None:
+                    return self._finalize(run, runtime_stop)
 
+            patch_repair_mode = (
+                last_result is not None and last_result.stop_reason == "git_apply_check_failed"
+            )
+            system_prompt = (
+                _PATCH_REPAIR_SYSTEM_PROMPT if patch_repair_mode else _PATCH_GENERATION_SYSTEM_PROMPT
+            )
             prompt = self._build_prompt(
                 repo_root=repo_root,
                 goal=goal,
@@ -388,14 +453,16 @@ class RepairController:
                 iteration=iteration,
                 profile=patch_route.profile,
                 policy=policy,
+                compact_context=patch_repair_mode,
+                last_result=last_result,
+                system_prompt=system_prompt,
+                repeated_rejected_patch_count=repeated_rejected_patch_count,
             )
             route = self.router.resolve(
                 "patch_generation",
                 profile_name=resolved_profile_name,
                 prompt_text=prompt,
-                system_prompt=(
-                    "You are a deterministic patch proposer. Return only a unified diff patch."
-                ),
+                system_prompt=system_prompt,
             )
             self.artifact_store.append_trace(
                 run,
@@ -408,32 +475,65 @@ class RepairController:
             )
 
             for candidate_index in range(1, max_candidates + 1):
-                runtime_stop = self._runtime_budget_stop(
-                    run=run,
-                    repo_root=repo_root,
-                    goal=goal,
-                    policy_path=policy_path,
-                    baseline_report=baseline_report,
-                    model_profile=resolved_profile_name,
-                    validation_report=last_result.validation_report if last_result else None,
-                    patch_path=last_result.patch_path if last_result else None,
-                    worktree_path=last_result.worktree_path if last_result else None,
-                    rejection_reasons=last_result.rejection_reasons if last_result else None,
-                    iterations_attempted=iteration - 1,
-                    candidates_attempted=candidates_attempted,
-                    started=started,
-                    max_total_runtime_seconds=max_total_runtime_seconds,
-                    stop_reason="max_total_runtime_reached",
-                )
-                if runtime_stop is not None:
-                    return self._finalize(run, runtime_stop)
+                if not until_success:
+                    runtime_stop = self._runtime_budget_stop(
+                        run=run,
+                        repo_root=repo_root,
+                        goal=goal,
+                        policy_path=policy_path,
+                        baseline_report=baseline_report,
+                        model_profile=resolved_profile_name,
+                        validation_report=last_result.validation_report if last_result else None,
+                        patch_path=last_result.patch_path if last_result else None,
+                        worktree_path=last_result.worktree_path if last_result else None,
+                        rejection_reasons=last_result.rejection_reasons if last_result else None,
+                        iterations_attempted=iteration - 1,
+                        candidates_attempted=candidates_attempted,
+                        started=started,
+                        max_total_runtime_seconds=max_total_runtime_seconds,
+                        stop_reason="max_total_runtime_reached",
+                    )
+                    if runtime_stop is not None:
+                        return self._finalize(run, runtime_stop)
                 candidates_attempted += 1
-                patch_text = client.generate_patch(
-                    system_prompt=(
-                        "You are a deterministic patch proposer. Return only a unified diff patch."
-                    ),
+                raw_patch_text = client.generate_patch(
+                    system_prompt=system_prompt,
                     user_prompt=prompt,
                 )
+                self.artifact_store.write_patch_raw_response(run, raw_patch_text)
+                try:
+                    patch_text = self._normalize_patch_text(
+                        normalize_patch_block(extract_patch_block(raw_patch_text))
+                    )
+                except PatchParseError as exc:
+                    last_result = RepairResult(
+                        run_id=run.run_id,
+                        repo_root=repo_root,
+                        goal=goal,
+                        status=RunStatus.PATCH_REJECTED,
+                        summary=str(exc),
+                        model_profile=route.profile_name,
+                        artifact_dir=run.artifact_dir,
+                        policy_path=policy_path,
+                        trace_path=run.trace_path,
+                        generated_test_patch_path=generated_test_stage.patch_path,
+                        baseline_report=baseline_report,
+                        generated_test_validation_report=generated_test_stage.validation_report,
+                        rejection_reasons=[str(exc)],
+                        generated_test_rejection_reasons=(
+                            generated_test_stage.rejection_reasons or []
+                        ),
+                        target_repo_changed=False,
+                        iterations_attempted=iteration,
+                        candidates_attempted=candidates_attempted,
+                        stop_reason="malformed_patch",
+                    )
+                    repeated_rejected_patch_count = self._record_rejected_patch_signature(
+                        seen_rejected_patches,
+                        stop_reason=last_result.stop_reason or "malformed_patch",
+                        rejection_reasons=last_result.rejection_reasons,
+                    )
+                    continue
                 patch_path = self.artifact_store.write_patch(run, patch_text)
                 self.artifact_store.append_trace(
                     run,
@@ -471,6 +571,55 @@ class RepairController:
                         iterations_attempted=iteration,
                         candidates_attempted=candidates_attempted,
                         stop_reason="malformed_patch",
+                    )
+                    repeated_rejected_patch_count = self._record_rejected_patch_signature(
+                        seen_rejected_patches,
+                        stop_reason=last_result.stop_reason or "malformed_patch",
+                        patch_text=patch_text,
+                        rejection_reasons=last_result.rejection_reasons,
+                    )
+                    continue
+
+                git_apply_error = self._preflight_patch_apply_error(
+                    repo_root=repo_root,
+                    patch_path=patch_path,
+                    pre_patch_paths=pre_patch_paths,
+                )
+                if git_apply_error is not None:
+                    guidance = (
+                        "Your previous patch could not be applied by git. git apply reported: "
+                        f"{git_apply_error}. Return a complete valid patch with correct hunk "
+                        "headers and real context lines."
+                    )
+                    last_result = RepairResult(
+                        run_id=run.run_id,
+                        repo_root=repo_root,
+                        goal=goal,
+                        status=RunStatus.PATCH_REJECTED,
+                        summary=guidance,
+                        model_profile=route.profile_name,
+                        artifact_dir=run.artifact_dir,
+                        policy_path=policy_path,
+                        trace_path=run.trace_path,
+                        summary_path=run.summary_path,
+                        patch_path=patch_path,
+                        generated_test_patch_path=generated_test_stage.patch_path,
+                        baseline_report=baseline_report,
+                        generated_test_validation_report=generated_test_stage.validation_report,
+                        rejection_reasons=[guidance],
+                        generated_test_rejection_reasons=(
+                            generated_test_stage.rejection_reasons or []
+                        ),
+                        target_repo_changed=False,
+                        iterations_attempted=iteration,
+                        candidates_attempted=candidates_attempted,
+                        stop_reason="git_apply_check_failed",
+                    )
+                    repeated_rejected_patch_count = self._record_rejected_patch_signature(
+                        seen_rejected_patches,
+                        stop_reason=last_result.stop_reason or "git_apply_check_failed",
+                        patch_text=patch_text,
+                        rejection_reasons=last_result.rejection_reasons,
                     )
                     continue
 
@@ -513,6 +662,12 @@ class RepairController:
                         iterations_attempted=iteration,
                         candidates_attempted=candidates_attempted,
                         stop_reason="patch_static_rejection",
+                    )
+                    repeated_rejected_patch_count = self._record_rejected_patch_signature(
+                        seen_rejected_patches,
+                        stop_reason=last_result.stop_reason or "patch_static_rejection",
+                        patch_text=patch_text,
+                        rejection_reasons=last_result.rejection_reasons,
                     )
                     continue
 
@@ -557,7 +712,7 @@ class RepairController:
                     },
                 )
 
-                if validation_report.status == RunStatus.NO_ACTION_NEEDED:
+                if validation_report.status in _PASSING_VALIDATION_STATUSES:
                     result = RepairResult(
                         run_id=run.run_id,
                         repo_root=repo_root,
@@ -584,9 +739,10 @@ class RepairController:
                         stop_reason="validation_passed",
                     )
                     return self._finalize(run, result)
+                repeated_rejected_patch_count = 0
 
                 signature = self._failure_signature(validation_report, parsed_patch)
-                if signature in seen_failures:
+                if not until_success and signature in seen_failures:
                     result = self._stopped_result(
                         run=run,
                         repo_root=repo_root,
@@ -660,6 +816,7 @@ class RepairController:
                     candidates_attempted=candidates_attempted,
                     stop_reason="candidate_failed_validation",
                 )
+            iteration += 1
 
         return self._finalize(
             run,
@@ -702,7 +859,27 @@ class RepairController:
         iteration: int,
         profile: ModelProfile,
         policy: CompiledPolicy,
+        compact_context: bool = False,
+        last_result: RepairResult | None = None,
+        system_prompt: str = _PATCH_GENERATION_SYSTEM_PROMPT,
+        repeated_rejected_patch_count: int = 0,
     ) -> str:
+        if (
+            compact_context
+            and last_result is not None
+            and last_result.stop_reason == "git_apply_check_failed"
+        ):
+            return self._build_patch_repair_prompt(
+                repo_root=repo_root,
+                goal=goal,
+                report=report,
+                iteration=iteration,
+                profile=profile,
+                policy=policy,
+                last_result=last_result,
+                system_prompt=system_prompt,
+                repeated_rejected_patch_count=repeated_rejected_patch_count,
+            )
         retry_guidance = self._retry_guidance(report.failure_class, iteration)
         header = (
             f"Goal: {goal}\n"
@@ -716,13 +893,168 @@ class RepairController:
             f"{self._repo_kind_guidance(policy)}\n"
             f"{retry_guidance}\n"
         )
-        return self._build_bounded_prompt(
+        prompt = self._build_bounded_prompt(
             repo_root=repo_root,
             report=report,
             profile=profile,
             header=header,
             mode="patch_generation",
+            include_repo_summary=not compact_context,
+            include_prompt_files=not compact_context,
+            compact_evidence=compact_context,
+            system_prompt=system_prompt,
         )
+        if last_result is not None:
+            feedback = self._retry_feedback(last_result, repo_root=repo_root)
+            if feedback:
+                prompt = self._fit_prompt_to_budget(
+                    f"{prompt}\n\nPatch retry feedback:\n{feedback}",
+                    profile=profile,
+                    system_prompt=system_prompt,
+                )
+        return prompt
+
+    def _build_patch_repair_prompt(
+        self,
+        *,
+        repo_root: Path,
+        goal: str,
+        report: ValidationReport,
+        iteration: int,
+        profile: ModelProfile,
+        policy: CompiledPolicy,
+        last_result: RepairResult,
+        system_prompt: str,
+        repeated_rejected_patch_count: int,
+    ) -> str:
+        retry_feedback = self._retry_feedback(
+            last_result,
+            repo_root=repo_root,
+            repeated_rejected_patch_count=repeated_rejected_patch_count,
+        )
+        header = (
+            f"Goal: {goal}\n"
+            f"Repository: {repo_root}\n"
+            f"Repository kind: {policy.repo_kind}\n"
+            f"Repair iteration: {iteration}\n"
+            f"Validation status: {report.status.value}\n"
+            f"Failure class: {report.failure_class.value if report.failure_class else 'NONE'}\n"
+            "Mode: patch_repair\n"
+            "The previous candidate patch was rejected before sandbox apply.\n"
+            "Repair the patch itself. Preserve the same intended file scope unless the target "
+            "file was clearly wrong. Return exactly one complete unified diff patch with real "
+            "context lines from the current repository files.\n"
+            f"{self._repo_kind_guidance(policy)}\n"
+            "Do not repeat the previous invalid patch verbatim.\n"
+        )
+        if repeated_rejected_patch_count >= 2:
+            header += (
+                f"The same rejected patch pattern has repeated {repeated_rejected_patch_count} "
+                "times. Regenerate the patch from the current repository files instead of "
+                "editing or paraphrasing the previous invalid patch.\n"
+            )
+        sections = [header.rstrip()]
+        if retry_feedback:
+            sections.append("Patch repair evidence:\n" + retry_feedback)
+        prompt = "\n\n".join(section for section in sections if section)
+        return self._fit_prompt_to_budget(
+            prompt,
+            profile=profile,
+            system_prompt=system_prompt,
+        )
+
+    def _retry_feedback(
+        self,
+        last_result: RepairResult | None,
+        *,
+        repo_root: Path,
+        repeated_rejected_patch_count: int = 0,
+    ) -> str:
+        if last_result is None or not last_result.rejection_reasons:
+            return ""
+        lines = ["\n".join(last_result.rejection_reasons)]
+        if (
+            last_result.stop_reason == "git_apply_check_failed"
+            and last_result.patch_path is not None
+            and last_result.patch_path.exists()
+        ):
+            patch_text = last_result.patch_path.read_text(encoding="utf-8")
+            lines.append(
+                "Your task is to repair the patch itself. Reuse the same intended file scope, "
+                "but return a syntactically valid unified diff with correct hunk headers and "
+                "real context lines from the current repository files."
+            )
+            if repeated_rejected_patch_count < 2:
+                lines.append(
+                    "Previous rejected patch:\n```diff\n"
+                    f"{patch_text[:_PROMPT_MAX_RETRY_PATCH_CHARS].rstrip()}\n```"
+                )
+            else:
+                lines.append(
+                    "The previous invalid patch has already been repeated. Do not reuse it. "
+                    "Reconstruct a fresh patch from the current file content below."
+                )
+            target_sections = self._retry_target_file_sections(repo_root, patch_text)
+            if target_sections:
+                lines.append("Current target file content:\n" + "\n\n".join(target_sections))
+        feedback = "\n\n".join(lines)
+        return feedback[:_PROMPT_MAX_RETRY_FEEDBACK_CHARS]
+
+    def _record_rejected_patch_signature(
+        self,
+        seen_rejected_patches: dict[RejectedPatchSignature, int],
+        *,
+        stop_reason: str,
+        patch_text: str | None = None,
+        rejection_reasons: list[str] | None = None,
+    ) -> int:
+        signature = RejectedPatchSignature(
+            stop_reason=stop_reason,
+            patch_hash=self._stable_text_hash(patch_text or ""),
+            rejection_hash=self._stable_text_hash("\n".join(rejection_reasons or [])),
+        )
+        count = seen_rejected_patches.get(signature, 0) + 1
+        seen_rejected_patches[signature] = count
+        return count
+
+    def _retry_target_file_sections(self, repo_root: Path, patch_text: str) -> list[str]:
+        sections: list[str] = []
+        for path in self._paths_from_patch_headers(patch_text):
+            file_path = repo_root / path
+            if not file_path.is_file():
+                continue
+            try:
+                content = file_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            truncated = content[:_PROMPT_MAX_RETRY_TARGET_FILE_CHARS].rstrip()
+            if len(content) > _PROMPT_MAX_RETRY_TARGET_FILE_CHARS:
+                truncated += "\n...[truncated]"
+            sections.append(f"FILE: {path}\n```text\n{truncated}\n```")
+            if len(sections) >= 3:
+                break
+        return sections
+
+    def _paths_from_patch_headers(self, patch_text: str) -> list[str]:
+        paths: list[str] = []
+        seen: set[str] = set()
+        for line in patch_text.splitlines():
+            candidate: str | None = None
+            if line.startswith("diff --git "):
+                parts = line.split()
+                if len(parts) >= 4 and parts[2].startswith("a/"):
+                    candidate = parts[2].removeprefix("a/")
+            elif line.startswith("--- a/"):
+                candidate = line.removeprefix("--- a/").strip()
+            elif line.startswith("+++ b/"):
+                candidate = line.removeprefix("+++ b/").strip()
+            if candidate and candidate != "/dev/null" and candidate not in seen:
+                seen.add(candidate)
+                paths.append(candidate)
+        return paths
+
+    def _normalize_patch_text(self, patch_text: str) -> str:
+        return patch_text.rstrip("\n") + "\n"
 
     def _build_test_generation_prompt(
         self,
@@ -749,6 +1081,7 @@ class RepairController:
             profile=profile,
             header=header,
             mode="test_generation",
+            system_prompt=_TEST_GENERATION_SYSTEM_PROMPT,
         )
 
     def _repo_kind_guidance(self, policy: CompiledPolicy) -> str:
@@ -860,15 +1193,15 @@ class RepairController:
                 "estimated_input_tokens": route.estimated_input_tokens,
             },
         )
-        patch_text = client.generate_patch(
-            system_prompt=(
-                "You generate deterministic regression test patches only. "
-                "Return only a unified diff patch."
-            ),
+        raw_patch_text = client.generate_patch(
+            system_prompt=_TEST_GENERATION_SYSTEM_PROMPT,
             user_prompt=prompt,
         )
-        patch_path = self.artifact_store.write_generated_test_patch(run, patch_text)
+        self.artifact_store.write_generated_test_patch_raw_response(run, raw_patch_text)
         try:
+            patch_text = self._normalize_patch_text(
+                normalize_patch_block(extract_patch_block(raw_patch_text))
+            )
             parsed_patch = self.patch_parser.parse(patch_text)
         except PatchParseError as exc:
             self.artifact_store.append_trace(
@@ -876,17 +1209,17 @@ class RepairController:
                 "generated_tests_created",
                 {
                     "model_profile": route.profile_name,
-                    "patch_path": str(patch_path),
+                    "patch_path": str(run.generated_test_patch_path),
                     "accepted": False,
                     "reasons": [str(exc)],
                 },
             )
             return GeneratedTestStage(
                 accepted=False,
-                patch_path=patch_path,
                 rejection_reasons=[str(exc)],
                 model_profile=route.profile_name,
             )
+        patch_path = self.artifact_store.write_generated_test_patch(run, patch_text)
 
         general_check = self.patch_parser.check(
             parsed_patch,
@@ -894,7 +1227,13 @@ class RepairController:
             max_diff_lines=max_diff_lines,
         )
         test_check_reasons = self._generated_test_patch_rejection_reasons(parsed_patch)
+        apply_error = self._preflight_patch_apply_error(
+            repo_root=repo_root,
+            patch_path=patch_path,
+        )
         reasons = [*general_check.reasons, *test_check_reasons]
+        if apply_error is not None:
+            reasons.append(apply_error)
         if reasons:
             self.artifact_store.append_trace(
                 run,
@@ -1004,16 +1343,20 @@ class RepairController:
         profile: ModelProfile,
         header: str,
         mode: str,
+        include_repo_summary: bool = True,
+        include_prompt_files: bool = True,
+        compact_evidence: bool = False,
+        system_prompt: str = "",
     ) -> str:
-        max_chars = self._prompt_char_budget(profile)
-        sections: list[str] = [header.rstrip(), self._command_evidence(report)]
-        repo_summary = self._repo_summary(repo_root)
+        max_chars = self._prompt_char_budget(profile, system_prompt=system_prompt)
+        sections: list[str] = [header.rstrip(), self._command_evidence(report, compact=compact_evidence)]
+        repo_summary = self._repo_summary(repo_root) if include_repo_summary else ""
         if repo_summary:
             sections.append(repo_summary)
 
         body = "\n\n".join(section for section in sections if section)
         remaining = max_chars - len(body) - 2
-        if remaining <= 0:
+        if remaining <= 0 or not include_prompt_files:
             return body[:max_chars]
 
         file_sections: list[str] = []
@@ -1031,18 +1374,44 @@ class RepairController:
                 break
         if file_sections:
             body = body + "\n\nRelevant repository files:\n" + "\n\n".join(file_sections)
-        return body[:max_chars]
+        return self._fit_prompt_to_budget(
+            body[:max_chars],
+            profile=profile,
+            system_prompt=system_prompt,
+        )
 
-    def _prompt_char_budget(self, profile: ModelProfile) -> int:
+    def _prompt_char_budget(self, profile: ModelProfile, *, system_prompt: str = "") -> int:
         if profile.context_window is None:
             return _PROMPT_DEFAULT_INPUT_TOKENS * 4
+        system_tokens = self._estimate_tokens(system_prompt)
         available_tokens = max(
-            profile.context_window - profile.max_output_tokens - _PROMPT_SAFETY_MARGIN_TOKENS,
+            profile.context_window
+            - profile.max_output_tokens
+            - system_tokens
+            - _PROMPT_SAFETY_MARGIN_TOKENS,
             256,
         )
         return available_tokens * 4
 
-    def _command_evidence(self, report: ValidationReport) -> str:
+    def _fit_prompt_to_budget(
+        self,
+        prompt: str,
+        *,
+        profile: ModelProfile,
+        system_prompt: str,
+    ) -> str:
+        max_chars = self._prompt_char_budget(profile, system_prompt=system_prompt)
+        return prompt[:max_chars]
+
+    def _estimate_tokens(self, text: str) -> int:
+        if not text:
+            return 0
+        return max(1, (len(text) + 3) // 4)
+
+    def _stable_text_hash(self, text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def _command_evidence(self, report: ValidationReport, *, compact: bool = False) -> str:
         sections: list[str] = ["Validation evidence:"]
         failed_command = self._failed_command(report)
         if failed_command is not None:
@@ -1053,13 +1422,15 @@ class RepairController:
             )
             if failed_command.category:
                 sections.append(f"Failed category: {failed_command.category}")
-        start_index = max(len(report.commands) - 2, 1)
-        for index, command in enumerate(report.commands[-3:], start=start_index):
+        recent_commands = report.commands[-1:] if compact else report.commands[-3:]
+        start_index = max(len(report.commands) - len(recent_commands) + 1, 1)
+        for index, command in enumerate(recent_commands, start=start_index):
             sections.append(
                 f"Command {index}: {' '.join(command.spec.command)} (exit {command.exit_code})"
             )
-            stdout_tail = self._tail_text(command.stdout, _PROMPT_MAX_COMMAND_TAIL_CHARS)
-            stderr_tail = self._tail_text(command.stderr, _PROMPT_MAX_COMMAND_TAIL_CHARS)
+            tail_budget = 600 if compact else _PROMPT_MAX_COMMAND_TAIL_CHARS
+            stdout_tail = self._tail_text(command.stdout, tail_budget)
+            stderr_tail = self._tail_text(command.stderr, tail_budget)
             if stdout_tail:
                 sections.append(f"stdout tail:\n```text\n{stdout_tail}\n```")
             if stderr_tail:
@@ -1068,7 +1439,10 @@ class RepairController:
             sections.append(f"Summary: {report.summary}")
         if report.warnings:
             sections.append("Warnings:")
-            sections.extend(f"- {warning}" for warning in report.warnings)
+            warnings = report.warnings[:6] if compact else report.warnings
+            sections.extend(f"- {warning}" for warning in warnings)
+            if compact and len(report.warnings) > len(warnings):
+                sections.append(f"- ... {len(report.warnings) - len(warnings)} more warnings omitted")
         return "\n".join(sections)
 
     def _has_actionable_repo_readability_warnings(
@@ -1350,7 +1724,7 @@ class RepairController:
                     "source": "formatter_repair",
                 },
             )
-            if validation_report.status == RunStatus.NO_ACTION_NEEDED:
+            if validation_report.status in _PASSING_VALIDATION_STATUSES:
                 return RepairResult(
                     run_id=run.run_id,
                     repo_root=repo_root,
@@ -1392,6 +1766,233 @@ class RepairController:
                 generated_test_validation_report=generated_test_stage.validation_report,
                 generated_test_rejection_reasons=generated_test_stage.rejection_reasons or [],
             )
+
+    def _attempt_workflow_readme_repair(
+        self,
+        *,
+        run: RunContext,
+        repo_root: Path,
+        goal: str,
+        policy: CompiledPolicy,
+        policy_path: Path,
+        baseline_report: ValidationReport,
+        model_profile: str,
+        keep_worktree: bool,
+        timeout_per_command: int,
+        max_diff_lines: int,
+        selected_python: Path | None,
+        generated_test_stage: GeneratedTestStage,
+    ) -> RepairResult | None:
+        if policy.repo_kind != "workflow_repo" or "implicit_script_chain" not in policy.workflow_sources:
+            return None
+        if not self._has_actionable_repo_readability_warnings(policy, baseline_report):
+            return None
+
+        profile = self.policy_compiler.repo_profiler.profile(repo_root)
+        readme_path = self._preferred_workflow_readme_path(repo_root, profile)
+        if readme_path is None:
+            return None
+        try:
+            original_text = readme_path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        updated_text = self._workflow_readme_text(repo_root, readme_path, original_text, profile)
+        if updated_text == original_text:
+            return None
+
+        patch_text = self._normalize_patch_text(
+            "\n".join(
+                difflib.unified_diff(
+                    original_text.splitlines(),
+                    updated_text.splitlines(),
+                    fromfile=f"a/{readme_path.relative_to(repo_root)}",
+                    tofile=f"b/{readme_path.relative_to(repo_root)}",
+                    lineterm="",
+                )
+            )
+        )
+        parsed_patch = self.patch_parser.parse(patch_text)
+        check = self.patch_parser.check(
+            parsed_patch,
+            policy=policy,
+            max_diff_lines=max_diff_lines,
+        )
+        self.artifact_store.append_trace(
+            run,
+            "patch_policy_checked",
+            {
+                "iteration": 0,
+                "candidate": 0,
+                "accepted": check.accepted,
+                "reasons": check.reasons,
+                "source": "workflow_readme_repair",
+            },
+        )
+        if not check.accepted:
+            return None
+
+        patch_path = self.artifact_store.write_patch(run, patch_text)
+        apply_error = self._preflight_patch_apply_error(
+            repo_root=repo_root,
+            patch_path=patch_path,
+            pre_patch_paths=[generated_test_stage.patch_path]
+            if generated_test_stage.accepted and generated_test_stage.patch_path is not None
+            else None,
+        )
+        if apply_error is not None:
+            return None
+
+        self.artifact_store.append_trace(
+            run,
+            "patch_validation_started",
+            {
+                "iteration": 0,
+                "candidate": 0,
+                "patch_path": str(patch_path),
+                "worktree_path": None,
+            },
+        )
+        validation_report, worktree_path = self._apply_and_validate(
+            repo_root=repo_root,
+            policy=policy,
+            patch_path=patch_path,
+            artifact_dir=run.log_dir / "workflow-readme-repair",
+            keep_worktree=keep_worktree,
+            timeout_per_command=timeout_per_command,
+            selected_python=selected_python,
+            pre_patch_paths=[generated_test_stage.patch_path]
+            if generated_test_stage.accepted and generated_test_stage.patch_path is not None
+            else None,
+            trace_callback=lambda event, payload: self.artifact_store.append_trace(
+                run, event, payload
+            ),
+            phase="workflow-readme-repair",
+        )
+        self.artifact_store.append_trace(
+            run,
+            "patch_validation_finished",
+            {
+                "iteration": 0,
+                "candidate": 0,
+                "status": validation_report.status.value,
+                "failure_class": (
+                    validation_report.failure_class.value
+                    if validation_report.failure_class
+                    else None
+                ),
+                "worktree_path": str(worktree_path),
+                "target_repo_changed": validation_report.target_repo_changed,
+            },
+        )
+        if validation_report.status not in _PASSING_VALIDATION_STATUSES:
+            return self._stop_for_terminal_failure(
+                run=run,
+                repo_root=repo_root,
+                goal=goal,
+                policy_path=policy_path,
+                baseline_report=baseline_report,
+                model_profile=model_profile,
+                validation_report=validation_report,
+                patch_path=patch_path,
+                generated_test_patch_path=generated_test_stage.patch_path,
+                worktree_path=worktree_path,
+                iterations_attempted=0,
+                candidates_attempted=0,
+                generated_test_validation_report=generated_test_stage.validation_report,
+                generated_test_rejection_reasons=generated_test_stage.rejection_reasons or [],
+            )
+
+        return RepairResult(
+            run_id=run.run_id,
+            repo_root=repo_root,
+            goal=goal,
+            status=RunStatus.SUCCESS,
+            summary="Workflow README auto-repair succeeded in an isolated worktree.",
+            model_profile=model_profile,
+            artifact_dir=run.artifact_dir,
+            policy_path=policy_path,
+            trace_path=run.trace_path,
+            summary_path=run.summary_path,
+            patch_path=patch_path,
+            generated_test_patch_path=generated_test_stage.patch_path,
+            baseline_report=baseline_report,
+            generated_test_validation_report=generated_test_stage.validation_report,
+            validation_report=validation_report,
+            generated_test_rejection_reasons=generated_test_stage.rejection_reasons or [],
+            worktree_path=worktree_path,
+            target_repo_changed=False,
+            iterations_attempted=0,
+            candidates_attempted=0,
+            stop_reason="workflow_readme_validation_passed",
+        )
+
+    def _preferred_workflow_readme_path(self, repo_root: Path, profile) -> Path | None:
+        candidates = [repo_root / "DataPipe" / "README.md", repo_root / "README.md"]
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate
+        build_scripts = profile.workflow_stage_scripts.get("build", [])
+        for script in build_scripts:
+            candidate = script.parent / "README.md"
+            if candidate.is_file():
+                return candidate
+        return None
+
+    def _workflow_readme_text(self, repo_root: Path, readme_path: Path, text: str, profile) -> str:
+        marker = "## Local-SWE Workflow Notes"
+        if marker in text:
+            return text
+
+        title, remainder = self._split_readme_title(text)
+        stage_lines = self._workflow_stage_lines(repo_root, profile)
+        note = (
+            f"{marker}\n\n"
+            "This repository behaves like an implicit script workflow rather than a single "
+            "package entrypoint. local-swe treats it as a documentation-first repair target and "
+            "does not run the full pipeline by default.\n\n"
+            "### Inferred stage order\n\n"
+            f"{stage_lines}\n\n"
+            "### Validation scope used by local-swe\n\n"
+            "- Hard checks stay bounded: `python -m py_compile`, `bash -n`, and notebook JSON parsing.\n"
+            "- Soft smoke checks may use `--help` only for scripts that appear safe to inspect.\n"
+            "- Full training, WSI processing, embedding extraction, GPU workloads, and end-to-end runs are intentionally skipped by default.\n"
+            "- Missing import-time dependencies such as `h5py`, `torch`, or `pandas` are treated as warnings during soft smoke checks.\n\n"
+            "### Runtime inputs and dependencies\n\n"
+            "- Build-stage data depends on Xenium raw data, aligned OME-TIFF slides, tissue masks, and precomputed tile directories described below.\n"
+            "- Training and evaluation stages depend on task config outputs produced by the build stage and on model checkpoints prepared outside local-swe validation.\n"
+            "- Known import-time dependencies for detected workflow scripts include `h5py`, `torch`, and `pandas`.\n"
+        )
+
+        pieces = [title.rstrip(), "", note.rstrip()]
+        if remainder.strip():
+            pieces.extend(["", remainder.lstrip("\n")])
+        return "\n".join(pieces).rstrip() + "\n"
+
+    def _split_readme_title(self, text: str) -> tuple[str, str]:
+        lines = text.splitlines(keepends=True)
+        if lines and lines[0].lstrip().startswith("# "):
+            return lines[0].rstrip("\n"), "".join(lines[1:])
+        return "# Workflow README", text
+
+    def _workflow_stage_lines(self, repo_root: Path, profile) -> str:
+        order = ("build", "train", "test", "eval")
+        labels = {
+            "build": "Build",
+            "train": "Train",
+            "test": "Test",
+            "eval": "Eval",
+        }
+        lines: list[str] = []
+        for stage in order:
+            paths = [
+                str(path.relative_to(repo_root))
+                for path in profile.workflow_stage_scripts.get(stage, [])
+                if path.name not in {"__init__.py", "utils.py", "dataset_framework.py", "h5tools.py"}
+            ][:4]
+            if not paths:
+                continue
+            lines.append(f"- {labels[stage]}: " + ", ".join(paths))
+        return "\n".join(lines)
 
     def _derive_formatter_write_command(self, command: list[str]) -> list[str] | None:
         normalized = list(command)
@@ -1559,6 +2160,35 @@ class RepairController:
                 phase=phase,
             )
             return report, managed.path
+
+    def _preflight_patch_apply_error(
+        self,
+        *,
+        repo_root: Path,
+        patch_path: Path,
+        pre_patch_paths: list[Path] | None = None,
+    ) -> str | None:
+        manager = WorktreeManager(keep_worktree=False)
+        with manager.session(repo_root) as managed:
+            for pre_patch_path in pre_patch_paths or []:
+                self._apply_patch(managed.path, pre_patch_path)
+            result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(managed.path),
+                    "apply",
+                    "--check",
+                    "--verbose",
+                    str(patch_path),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode == 0:
+                return None
+            return result.stderr.strip() or result.stdout.strip() or "git apply failed"
 
     def _apply_patch(self, worktree_path: Path, patch_path: Path) -> None:
         for args in (["apply", "--check", str(patch_path)], ["apply", str(patch_path)]):

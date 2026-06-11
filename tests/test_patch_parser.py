@@ -8,7 +8,12 @@ import pytest
 from local_swe_controller.config import PatchPolicyConfig, PatchRejectByDefaultConfig
 from local_swe_controller.models import CommandSpec
 from local_swe_controller.policy.schema import CompiledPolicy
-from local_swe_controller.repair.patch_parser import PatchParseError, PatchParser
+from local_swe_controller.repair.patch_parser import (
+    PatchParseError,
+    PatchParser,
+    extract_patch_block,
+    normalize_patch_block,
+)
 
 
 def test_parse_patch_extracts_change_metadata() -> None:
@@ -27,9 +32,70 @@ def test_parse_patch_extracts_change_metadata() -> None:
     assert parsed.files[0].removed_lines == ["return left - right"]
 
 
+def test_extract_patch_block_handles_fenced_diff_with_wrappers() -> None:
+    response = (
+        "<think>reasoning</think>\n\n"
+        "Here is the patch.\n"
+        "```diff\n"
+        "--- a/src/example_pkg/__init__.py\n"
+        "+++ b/src/example_pkg/__init__.py\n"
+        "@@ -1 +1 @@\n"
+        "-return left - right\n"
+        "+return left + right\n"
+        "```\n"
+        "Applied carefully.\n"
+    )
+
+    extracted = extract_patch_block(response)
+
+    assert extracted.startswith("--- a/src/example_pkg/__init__.py")
+    assert "```" not in extracted
+    assert "<think>" not in extracted
+
+
+def test_extract_patch_block_handles_apply_patch_wrapper() -> None:
+    response = (
+        "I will use apply_patch.\n"
+        "*** Begin Patch\n"
+        "*** Update File: README.md\n"
+        "@@\n"
+        "-old\n"
+        "+new\n"
+        "*** End Patch\n"
+        "done\n"
+    )
+
+    extracted = extract_patch_block(response)
+
+    assert extracted.startswith("*** Begin Patch")
+    assert extracted.endswith("*** End Patch")
+
+
 def test_parse_patch_rejects_malformed_input() -> None:
-    with pytest.raises(PatchParseError, match="unexpected content before file header"):
+    with pytest.raises(PatchParseError, match="No valid patch block found"):
         PatchParser().parse("not a diff\n")
+
+
+def test_extract_patch_block_rejects_missing_patch() -> None:
+    with pytest.raises(PatchParseError, match="No valid patch block found"):
+        extract_patch_block("<think>done</think>\nNo patch here.\n")
+
+
+def test_normalize_patch_block_repairs_hunk_line_counts() -> None:
+    patch = (
+        "--- a/README.md\n"
+        "+++ b/README.md\n"
+        "@@ -1,99 +1,99 @@\n"
+        " line one\n"
+        "-line two\n"
+        "+line too\n"
+        " line three\n"
+    )
+
+    normalized = normalize_patch_block(patch)
+
+    assert "@@ -1,3 +1,3 @@" in normalized
+    assert "@@ -1,99 +1,99 @@" not in normalized
 
 
 def test_patch_check_rejects_forbidden_changes(tmp_path: Path) -> None:

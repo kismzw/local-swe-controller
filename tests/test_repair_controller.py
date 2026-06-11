@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 from local_swe_controller.models import RunStatus
-from local_swe_controller.repair.controller import RepairController
+from local_swe_controller.repair.controller import RepairController, RepairResult
 from local_swe_controller.storage import ArtifactStore
 
 
@@ -331,6 +331,273 @@ def test_repair_stops_at_max_iterations(
     assert client.calls == 1
 
 
+def test_repair_normalizes_wrapped_patch_artifact_and_keeps_raw_response(
+    project_root: Path,
+    git_repo_factory,
+    init_git_repo,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    repo = _make_repair_repo(git_repo_factory("wrapped-patch"), "test", "FAILED still broken")
+    init_git_repo(repo)
+    wrapped_patch = (
+        "Here is the patch.\n"
+        "```diff\n"
+        "--- a/README.md\n"
+        "+++ b/README.md\n"
+        "@@ -1 +1 @@\n"
+        "-broken\n"
+        "+fixed\n"
+        "```\n"
+    )
+    client = RecordingClient([wrapped_patch])
+
+    controller = _controller(project_root, tmp_path)
+    monkeypatch.setattr(controller, "_build_client", lambda *_args, **_kwargs: client)
+    result = controller.repair(
+        repo_path=repo,
+        goal="Fix failing tests",
+        model_profile_name="fake",
+        max_iters=1,
+        max_candidates=1,
+    )
+
+    assert result.patch_path is not None
+    assert result.patch_path.read_text(encoding="utf-8").startswith("--- a/README.md")
+    assert "```diff" not in result.patch_path.read_text(encoding="utf-8")
+    assert result.patch_path.with_suffix(".raw.txt").read_text(encoding="utf-8") == wrapped_patch
+
+
+def test_repair_feeds_git_apply_failure_into_retry_prompt(
+    project_root: Path,
+    git_repo_factory,
+    init_git_repo,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    repo = _make_repair_repo(git_repo_factory("git-apply-retry"), "test", "FAILED still broken")
+    init_git_repo(repo)
+    client = RecordingClient(
+        [
+            (
+                "--- a/README.md\n"
+                "+++ b/README.md\n"
+                "@@ -1 +1 @@\n"
+                "-does not match\n"
+                "+fixed\n"
+            ),
+            _readme_patch("fixed"),
+        ]
+    )
+
+    controller = _controller(project_root, tmp_path)
+    monkeypatch.setattr(controller, "_build_client", lambda *_args, **_kwargs: client)
+    result = controller.repair(
+        repo_path=repo,
+        goal="Fix failing tests",
+        model_profile_name="fake",
+        max_iters=2,
+        max_candidates=1,
+    )
+
+    assert result.status == RunStatus.STOPPED_BY_BUDGET
+    assert len(client.prompts) == 2
+    assert "Your previous patch could not be applied by git." in client.prompts[1]
+    assert "Previous rejected patch:" in client.prompts[1]
+    assert "Current target file content:" in client.prompts[1]
+    assert "FILE: README.md" in client.prompts[1]
+    assert "Compact repo summary:" not in client.prompts[1]
+    assert "Relevant repository files:" not in client.prompts[1]
+
+
+def test_repair_can_recover_from_git_apply_failure_with_patch_repair_prompt(
+    project_root: Path,
+    temp_fixture_repo: Path,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    repo = temp_fixture_repo
+    target_file = repo / "src" / "example_pkg" / "__init__.py"
+    target_file.write_text(
+        '"""Example package for fixture repo."""\n\n\n'
+        "def add(left: int, right: int) -> int:\n"
+        "    return left - right\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "Introduce failing source"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    client = RecordingClient(
+        [
+            (
+                "--- a/src/example_pkg/__init__.py\n"
+                "+++ b/src/example_pkg/__init__.py\n"
+                "@@ -2,4 +2,4 @@\n"
+                " \n"
+                " \n"
+                " def add(left: int, right: int) -> int:\n"
+                "-    return left + right\n"
+                "+    return left + left\n"
+            ),
+            _source_patch_fix_add(),
+        ]
+    )
+
+    controller = _controller(project_root, tmp_path)
+    monkeypatch.setattr(controller, "_build_client", lambda *_args, **_kwargs: client)
+    result = controller.repair(
+        repo_path=repo,
+        goal="Fix tests",
+        model_profile_name="fake",
+        max_iters=2,
+        max_candidates=1,
+    )
+
+    assert result.status == RunStatus.SUCCESS
+    assert len(client.prompts) == 2
+    assert "Mode: patch_repair" in client.prompts[1]
+    assert "Patch repair evidence:" in client.prompts[1]
+    assert "FILE: src/example_pkg/__init__.py" in client.prompts[1]
+    assert "Relevant repository files:" not in client.prompts[1]
+
+
+def test_patch_repair_prompt_stays_within_context_window(
+    project_root: Path,
+    git_repo_factory,
+    init_git_repo,
+    tmp_path: Path,
+) -> None:
+    repo = _make_repair_repo(git_repo_factory("patch-repair-budget"), "test", "FAILED still broken")
+    readme = repo / "README.md"
+    readme.write_text("example\n" + ("section\n" * 20000), encoding="utf-8")
+    init_git_repo(repo)
+
+    controller = _controller(project_root, tmp_path)
+    policy = controller.policy_compiler.compile(repo)
+    report = controller.validation_runner.validate(repo, policy=policy)
+    route = controller.router.resolve("patch_generation", profile_name="fake")
+    patch_path = tmp_path / "rejected.patch"
+    patch_path.write_text(
+        "--- a/README.md\n"
+        "+++ b/README.md\n"
+        "@@ -1 +1 @@\n"
+        "-does not match\n"
+        "+fixed\n"
+        + ("# extra context\n" * 5000),
+        encoding="utf-8",
+    )
+    last_result = RepairResult(
+        run_id="retry-budget",
+        repo_root=repo,
+        goal="Fix tests",
+        status=RunStatus.PATCH_REJECTED,
+        summary="git apply failed",
+        model_profile=route.profile_name,
+        artifact_dir=tmp_path,
+        policy_path=project_root / "configs" / "default_policy.yaml",
+        trace_path=tmp_path / "trace.jsonl",
+        patch_path=patch_path,
+        baseline_report=report,
+        rejection_reasons=[
+            "Your previous patch could not be applied by git. git apply reported: "
+            + ("error: corrupt patch at line 22. " * 2000)
+        ],
+        stop_reason="git_apply_check_failed",
+    )
+
+    prompt = controller._build_prompt(
+        repo_root=repo,
+        goal="Fix tests",
+        report=report,
+        iteration=2,
+        profile=route.profile,
+        policy=policy,
+        compact_context=True,
+        last_result=last_result,
+        system_prompt="system",
+    )
+
+    selection = controller.router.resolve(
+        "patch_generation",
+        profile_name="fake",
+        prompt_text=prompt,
+        system_prompt="system",
+    )
+
+    assert "Mode: patch_repair" in prompt
+    assert "Patch repair evidence:" in prompt
+    assert selection.estimated_input_tokens is not None
+    assert route.profile.context_window is not None
+    assert (
+        selection.estimated_input_tokens + route.profile.max_output_tokens
+        <= route.profile.context_window
+    )
+
+
+def test_repeated_git_apply_rejection_drops_previous_invalid_patch_anchor(
+    project_root: Path,
+    git_repo_factory,
+    init_git_repo,
+    tmp_path: Path,
+) -> None:
+    repo = _make_repair_repo(git_repo_factory("patch-repeat-anchor"), "test", "FAILED still broken")
+    init_git_repo(repo)
+
+    controller = _controller(project_root, tmp_path)
+    policy = controller.policy_compiler.compile(repo)
+    report = controller.validation_runner.validate(repo, policy=policy)
+    route = controller.router.resolve("patch_generation", profile_name="fake")
+    patch_text = (
+        "--- a/README.md\n"
+        "+++ b/README.md\n"
+        "@@ -1 +1 @@\n"
+        "-does not match\n"
+        "+fixed\n"
+    )
+    patch_path = tmp_path / "repeat.patch"
+    patch_path.write_text(patch_text, encoding="utf-8")
+    last_result = RepairResult(
+        run_id="repeat-anchor",
+        repo_root=repo,
+        goal="Fix tests",
+        status=RunStatus.PATCH_REJECTED,
+        summary="git apply failed",
+        model_profile=route.profile_name,
+        artifact_dir=tmp_path,
+        policy_path=project_root / "configs" / "default_policy.yaml",
+        trace_path=tmp_path / "trace.jsonl",
+        patch_path=patch_path,
+        baseline_report=report,
+        rejection_reasons=[
+            "Your previous patch could not be applied by git. git apply reported: "
+            "error: corrupt patch at line 4."
+        ],
+        stop_reason="git_apply_check_failed",
+    )
+
+    prompt = controller._build_prompt(
+        repo_root=repo,
+        goal="Fix tests",
+        report=report,
+        iteration=3,
+        profile=route.profile,
+        policy=policy,
+        compact_context=True,
+        last_result=last_result,
+        system_prompt="system",
+        repeated_rejected_patch_count=2,
+    )
+
+    assert "The same rejected patch pattern has repeated 2 times" in prompt
+    assert "The previous invalid patch has already been repeated. Do not reuse it." in prompt
+    assert "Previous rejected patch:" not in prompt
+    assert "FILE: README.md" in prompt
+
+
 def test_repair_stops_on_repeated_identical_failure(
     project_root: Path,
     git_repo_factory,
@@ -511,7 +778,54 @@ def test_repair_tries_next_candidate_after_invalid_patch(
     assert result.candidates_attempted == 2
     assert client.calls == 2
     assert result.patch_path is not None
-    assert result.patch_path.read_text(encoding="utf-8") == _readme_patch("second-attempt")
+    assert result.patch_path.read_text(encoding="utf-8") == (
+        "--- a/README.md\n"
+        "+++ b/README.md\n"
+        "@@ -1,1 +1,1 @@\n"
+        "-example\n"
+        "+second-attempt\n"
+    )
+
+
+def test_repair_until_success_ignores_iteration_budget(
+    project_root: Path,
+    temp_fixture_repo: Path,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    repo = temp_fixture_repo
+    target_file = repo / "src" / "example_pkg" / "__init__.py"
+    target_file.write_text(
+        '"""Example package for fixture repo."""\n\n\n'
+        "def add(left: int, right: int) -> int:\n"
+        "    return left - right\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "Introduce failing source"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    client = RecordingClient(["not a patch", _source_patch_fix_add()])
+
+    controller = _controller(project_root, tmp_path)
+    monkeypatch.setattr(controller, "_build_client", lambda *_args, **_kwargs: client)
+
+    result = controller.repair(
+        repo_path=repo,
+        goal="Fix tests",
+        model_profile_name="fake",
+        max_iters=1,
+        max_candidates=1,
+        until_success=True,
+    )
+
+    assert result.status == RunStatus.SUCCESS
+    assert result.iterations_attempted == 2
+    assert result.candidates_attempted == 2
+    assert client.calls == 2
 
 
 def test_test_failure_fallback_still_uses_model_with_bounded_prompt(
@@ -667,6 +981,31 @@ def test_implicit_workflow_prompt_prefers_readme_only_and_forbids_unsafe_cli_boi
     assert "Do not add argparse to library, helper, or model modules" in prompt
     assert "Do not add parse_args() at module import time" in prompt
     assert 'parser.add_argument("--help"' in prompt
+
+
+def test_implicit_workflow_repo_uses_deterministic_readme_repair_first(
+    project_root: Path,
+    temp_script_workflow_repo: Path,
+    tmp_path: Path,
+) -> None:
+    controller = _controller(project_root, tmp_path)
+
+    result = controller.repair(
+        repo_path=temp_script_workflow_repo,
+        goal="Improve workflow readability without changing behavior",
+        model_profile_name="fake",
+        max_iters=1,
+        max_candidates=1,
+    )
+
+    assert result.status == RunStatus.SUCCESS
+    assert result.stop_reason == "workflow_readme_validation_passed"
+    assert result.patch_path is not None
+    patch_text = result.patch_path.read_text(encoding="utf-8")
+    assert "Local-SWE Workflow Notes" in patch_text
+    assert "Inferred stage order" in patch_text
+    assert "- Build:" in patch_text
+    assert "- Train:" in patch_text
 
 
 def _controller(project_root: Path, tmp_path: Path) -> RepairController:

@@ -46,6 +46,216 @@ _ARGPARSE_SIGNAL_PATTERN = re.compile(r"\b(argparse|ArgumentParser|add_argument|
 class PatchParseError(ValueError):
     """Raised when a candidate patch is malformed or unsafe."""
 
+_FENCED_PATCH_PATTERN = re.compile(
+    r"```(?:diff|patch)?\s*\n(?P<body>.*?)\n```",
+    flags=re.DOTALL | re.IGNORECASE,
+)
+_DIFF_GIT_PATTERN = re.compile(r"^diff --git a/.+ b/.+$")
+_OLD_FILE_PATTERN = re.compile(r"^--- (?:a/.+|/dev/null)$")
+_NEW_FILE_PATTERN = re.compile(r"^\+\+\+ (?:b/.+|/dev/null)$")
+_PATCH_META_PREFIXES = (
+    "index ",
+    "new file mode ",
+    "deleted file mode ",
+    "old mode ",
+    "new mode ",
+    "similarity index ",
+    "rename from ",
+    "rename to ",
+    "copy from ",
+    "copy to ",
+)
+_HUNK_HEADER_PATTERN = re.compile(
+    r"^@@ -(?P<old_start>\d+)(?:,(?P<old_count>\d+))? "
+    r"\+(?P<new_start>\d+)(?:,(?P<new_count>\d+))? @@(?P<suffix>.*)$"
+)
+
+
+def extract_patch_block(response_text: str) -> str:
+    """Extract a valid patch block from a possibly wrapped LLM response."""
+
+    text = response_text.strip()
+    if not text:
+        raise PatchParseError("Patch is empty.")
+
+    apply_patch_block = _extract_apply_patch_block(text)
+    if apply_patch_block is not None:
+        return apply_patch_block
+
+    # Prefer fenced patch/diff blocks if they contain a real patch header.
+    for match in _FENCED_PATCH_PATTERN.finditer(text):
+        body = match.group("body").strip()
+        if _looks_like_patch(body):
+            return body
+
+    diff_git_block = _extract_unified_diff_block(text.splitlines(), prefer_diff_git=True)
+    if diff_git_block is not None:
+        return diff_git_block
+    unified_block = _extract_unified_diff_block(text.splitlines(), prefer_diff_git=False)
+    if unified_block is not None:
+        return unified_block
+
+    raise PatchParseError("No valid patch block found in model response.")
+
+
+def normalize_patch_block(patch_text: str) -> str:
+    """Normalize extracted patches into a stricter format.
+
+    Currently this repairs unified-diff hunk line counts using the actual hunk body so
+    common local-model count mistakes still produce an applicable patch artifact.
+    """
+
+    text = patch_text.strip()
+    if not text or text.startswith("*** Begin Patch"):
+        return text
+
+    lines = text.splitlines()
+    normalized: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        match = _HUNK_HEADER_PATTERN.match(line)
+        if match is None:
+            normalized.append(line)
+            index += 1
+            continue
+
+        hunk_lines: list[str] = []
+        index += 1
+        while index < len(lines):
+            next_line = lines[index]
+            if _HUNK_HEADER_PATTERN.match(next_line):
+                break
+            if next_line.startswith(("--- ", "diff --git ")):
+                break
+            hunk_lines.append(next_line)
+            index += 1
+
+        old_count = sum(1 for item in hunk_lines if item.startswith((" ", "-")))
+        new_count = sum(1 for item in hunk_lines if item.startswith((" ", "+")))
+        suffix = match.group("suffix") or ""
+        normalized.append(
+            "@@ "
+            f"-{match.group('old_start')},{old_count} "
+            f"+{match.group('new_start')},{new_count} "
+            f"@@{suffix}"
+        )
+        normalized.extend(hunk_lines)
+
+    return "\n".join(normalized)
+
+
+def _looks_like_patch(text: str) -> bool:
+    lines = text.lstrip().splitlines()
+    if not lines:
+        return False
+    if lines[0].startswith("*** Begin Patch"):
+        return "*** End Patch" in text
+    if lines[0].startswith("diff --git "):
+        return True
+    return len(lines) >= 2 and lines[0].startswith("--- ") and lines[1].startswith("+++ ")
+
+
+def _extract_apply_patch_block(text: str) -> str | None:
+    begin = text.find("*** Begin Patch")
+    end = text.find("*** End Patch")
+    if begin == -1 or end == -1 or end <= begin:
+        return None
+    return text[begin : end + len("*** End Patch")].strip()
+
+
+def _extract_unified_diff_block(lines: list[str], *, prefer_diff_git: bool) -> str | None:
+    start_indexes: list[int] = []
+    if prefer_diff_git:
+        start_indexes = [index for index, line in enumerate(lines) if line.startswith("diff --git ")]
+    else:
+        for index in range(len(lines) - 1):
+            if _OLD_FILE_PATTERN.match(lines[index]) and _NEW_FILE_PATTERN.match(lines[index + 1]):
+                start_indexes.append(index)
+    for start in start_indexes:
+        extracted = _slice_patch_lines(lines, start)
+        if extracted is not None and _looks_like_patch(extracted):
+            return extracted
+    return None
+
+
+def _slice_patch_lines(lines: list[str], start: int) -> str | None:
+    collected: list[str] = []
+    seen_file = False
+    seen_hunk = False
+    expect_new = False
+    in_hunk = False
+
+    for line in lines[start:]:
+        if not collected and not _is_patch_start_line(line):
+            return None
+        if line.startswith("diff --git "):
+            if collected and seen_file and not expect_new:
+                next_line = line
+                collected.append(next_line)
+                seen_file = False
+                seen_hunk = False
+                expect_new = False
+                in_hunk = False
+                continue
+            collected.append(line)
+            continue
+        if line.startswith(_PATCH_META_PREFIXES):
+            if not collected:
+                return None
+            collected.append(line)
+            continue
+        if _OLD_FILE_PATTERN.match(line):
+            if seen_hunk and not expect_new:
+                seen_file = True
+                seen_hunk = False
+                expect_new = True
+                in_hunk = False
+                collected.append(line)
+                continue
+            seen_file = True
+            expect_new = True
+            in_hunk = False
+            collected.append(line)
+            continue
+        if _NEW_FILE_PATTERN.match(line):
+            if not expect_new:
+                break
+            expect_new = False
+            collected.append(line)
+            continue
+        if line.startswith("@@ "):
+            if expect_new or not seen_file:
+                break
+            seen_hunk = True
+            in_hunk = True
+            collected.append(line)
+            continue
+        if _is_hunk_line(line):
+            if not in_hunk:
+                break
+            collected.append(line)
+            continue
+        if line == "" and in_hunk:
+            break
+        if seen_hunk:
+            break
+        if collected:
+            break
+    if not seen_file or expect_new or not seen_hunk:
+        return None
+    return "\n".join(collected).strip()
+
+
+def _is_patch_start_line(line: str) -> bool:
+    return line.startswith("diff --git ") or _OLD_FILE_PATTERN.match(line) is not None
+
+
+def _is_hunk_line(line: str) -> bool:
+    return (
+        line.startswith(("+", "-", " "))
+        or line == r"\ No newline at end of file"
+    )
 
 @dataclass(slots=True)
 class PatchHunk:
@@ -100,6 +310,7 @@ class PatchParser:
     """Parse and safety-check unified diffs."""
 
     def parse(self, patch_text: str) -> ParsedPatch:
+        patch_text = extract_patch_block(patch_text)
         lines = patch_text.splitlines()
         if not lines:
             raise PatchParseError("Patch is empty.")
